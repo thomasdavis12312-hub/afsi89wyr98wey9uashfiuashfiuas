@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.tmp-steam-*/
+.tmp-steam-template-*/
+*.log
+.env
+bot.db
+bot.db-shm
+bot.db-wal
+backups/
