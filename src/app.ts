@@ -28,6 +28,7 @@ type UserFlow =
   | { mode: "draw_input:ban_cs2"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:code_cs2"; payload: { variant: "fake" | "not_found"; promptMessageId: number | null } }
   | { mode: "draw_input:code_cs2_mammoth_code"; payload: { profileUrl: string; promptMessageId: number | null } }
+  | { mode: "draw_input:code_dota2_mammoth_code"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:qr_page_link"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:qr_page_time"; payload: { inviteLink: string; promptMessageId: number | null } }
   | { mode: "draw_input:friend_page"; payload: { variant: "normal" | "not_found"; promptMessageId: number | null } }
@@ -732,7 +733,7 @@ async function renderDrawMenu(ctx: Ctx) {
         [Markup.button.callback("🛡️ Ошибка Steam Guard", "draw:steam_guard_error")],
         [Markup.button.callback("🚫 Бан CS2", "draw:ban_cs2")],
         [Markup.button.callback("🔑 Код CS2", "draw:code_cs2")],
-        [Markup.button.callback("⚔️ Бан DOTA 2", "draw:ban_dota2")],
+        [Markup.button.callback("🔑 Код DOTA 2", "draw:code_dota2")],
       ]).reply_markup,
     },
   );
@@ -840,6 +841,20 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       ctx,
       () => makeSteamCodeCs2NotFoundScreenshot(profileUrl, text),
       "Не удалось создать скриншот кода CS2.",
+    );
+    return;
+  }
+
+  if (mode === "code_dota2_mammoth_code") {
+    if (!text) {
+      await ctx.reply("Код DOTA 2 не должен быть пустым.");
+      return;
+    }
+    state.delete(ctx.from.id);
+    await runDrawJob(
+      ctx,
+      () => makeDota2CodeNotFoundScreenshot(text),
+      "Не удалось создать скриншот кода DOTA 2.",
     );
     return;
   }
@@ -1983,6 +1998,55 @@ async function makeSteamCodeCs2NotFoundScreenshot(profileUrl: string, mammothCod
   return run;
 }
 
+async function makeDota2FakeCodeScreenshot() {
+  const templatePath = path.join(process.cwd(), "src", "templates", "code-dota2-fake.png");
+  const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-dota2-code-fake-"));
+  const screenshotPath = path.join(tmpDir, `code_dota2_fake_${Date.now()}.png`);
+  await fs.copyFile(templatePath, screenshotPath);
+  return screenshotPath;
+}
+
+async function makeDota2CodeNotFoundScreenshot(mammothCode: string) {
+  const task = async () => {
+    await ensureSteamRendererReady();
+    const templatePath = path.join(process.cwd(), "src", "templates", "code-dota2-not-found.png");
+    const fontPath = path.join(process.cwd(), "src", "templates", "radiance.ttf");
+    const templateUrl = `file:///${templatePath.replace(/\\/g, "/")}`;
+    const fontUrl = `file:///${fontPath.replace(/\\/g, "/")}`;
+    const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-dota2-code-not-found-"));
+    const tempHtmlPath = path.join(tmpDir, `code_dota2_nf_${Date.now()}.html`);
+    const screenshotPath = path.join(tmpDir, `code_dota2_nf_${Date.now()}.png`);
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @font-face { font-family: "Radiance"; src: url("${fontUrl}") format("truetype"); font-weight: normal; font-style: normal; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+    body { position: relative; }
+    .bg { position: absolute; left: 0; top: 0; width: auto; height: auto; }
+    .code { position: absolute; left: 802px; top: 243.5px; font-family: "Radiance", sans-serif; color: #b0b8cb; font-size: 18px; line-height: 22px; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <img class="bg" src="${templateUrl}" alt="template" />
+  <div class="code">${escapeHtml(mammothCode)}</div>
+</body>
+</html>`;
+    await fs.writeFile(tempHtmlPath, html, "utf8");
+    await steamTemplatePage.goto(`file:///${tempHtmlPath.replace(/\\/g, "/")}`, { waitUntil: "domcontentloaded", timeout: 12000 });
+    await steamTemplatePage.evaluate(() => document.fonts?.ready).catch(() => null);
+    const dims = await sizeSteamTemplatePageFromBackground(steamTemplatePage, { w: 1996, h: 1216 });
+    await steamTemplatePage.screenshot({ path: screenshotPath, clip: { x: 0, y: 0, width: dims.w, height: dims.h } });
+    return screenshotPath;
+  };
+
+  const run = steamRenderChain.then(task, task);
+  steamRenderChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 bot.catch(async (error, ctx) => {
   console.error("[BOT ERROR]", error);
   await ctx.reply("Что-то сломалось во время обработки запроса. Попробуйте еще раз.").catch(() => null);
@@ -2214,10 +2278,36 @@ bot.on("callback_query", async (ctx, next) => {
     return;
   }
 
-  if (data === "draw:ban_dota2") {
-    await replaceOrReply(ctx, `<b>Раздел временно недоступен.</b>`, {
+  if (data === "draw:code_dota2" || data === "draw:ban_dota2") {
+    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
       parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("🔎 Не найдено", "draw:code_dota2:not_found"),
+          Markup.button.callback("🎭 Фейк-код", "draw:code_dota2:fake"),
+        ],
+        [Markup.button.callback("⬅️ Назад", "draw:menu")],
+      ]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "draw:code_dota2:fake") {
+    state.delete(ctx.from.id);
+    await ctx.answerCbQuery().catch(() => null);
+    await runDrawJob(ctx, makeDota2FakeCodeScreenshot, "Не удалось отправить скриншот кода DOTA 2.");
+    return;
+  }
+
+  if (data === "draw:code_dota2:not_found") {
+    state.set(ctx.from.id, {
+      mode: "draw_input:code_dota2_mammoth_code",
+      payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
+    });
+    await replaceOrReply(ctx, `<b>Введите код мамонта.</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:code_dota2")]]).reply_markup,
     });
     await ctx.answerCbQuery().catch(() => null);
     return;
