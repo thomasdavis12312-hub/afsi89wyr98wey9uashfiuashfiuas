@@ -21,7 +21,7 @@ export function mainKbForRole(isAdmin: boolean) {
 
 export const adminKb = Markup.keyboard([
   ["Пользователи", "Статистика"],
-  ["Логи"],
+  ["Логи", "Рассылка"],
 ]).resize();
 
 export function langInlineKb(currentLangRaw: string) {

