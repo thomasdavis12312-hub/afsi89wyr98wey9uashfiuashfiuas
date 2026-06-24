@@ -2380,16 +2380,16 @@ async function makeDota2CodeNotFoundScreenshot(mammothCode: string) {
     .code {
       position: absolute;
       left: 802px;
-      top: 243.5px;
+      top: 244px;
       font-family: "Radiance", sans-serif;
-      color: #c8ccd6;
+      color: #b9bec9;
       font-size: 18.75px;
       line-height: 22px;
       white-space: nowrap;
       letter-spacing: 0.2px;
       text-shadow:
         0 1px 1px rgba(0, 0, 0, 0.75),
-        0 0 2px rgba(210, 216, 230, 0.35);
+        0 0 2px rgba(185, 190, 202, 0.25);
       -webkit-font-smoothing: antialiased;
       text-rendering: geometricPrecision;
     }
