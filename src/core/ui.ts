@@ -2,17 +2,20 @@
 
 export const mainKb = Markup.keyboard([
   ["🖌️ Отрисовка", "🟢 Чекер онлайна"],
+  ["⚙️ Настройки"],
 ]).resize();
 
 export function mainKbForRole(isAdmin: boolean) {
   if (isAdmin) {
     return Markup.keyboard([
       ["🖌️ Отрисовка", "🟢 Чекер онлайна"],
+      ["⚙️ Настройки"],
     ]).resize();
   }
 
   return Markup.keyboard([
     ["🖌️ Отрисовка", "🟢 Чекер онлайна"],
+    ["⚙️ Настройки"],
   ]).resize();
 }
 

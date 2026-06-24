@@ -36,6 +36,7 @@ type NotificationPrefsRow = {
   notif_join: number;
   notif_panel: number;
   notif_rent: number;
+  phishing_link?: string | null;
 };
 
 type AppStoreState = {
@@ -166,8 +167,12 @@ export function createFileStoreDatabase(filePathRaw: string) {
         notif_join: 1,
         notif_panel: 1,
         notif_rent: 1,
+        phishing_link: null,
       };
       state.notification_prefs.push(row);
+      schedulePersist();
+    } else if (!("phishing_link" in row)) {
+      row.phishing_link = null;
       schedulePersist();
     }
     return row;

