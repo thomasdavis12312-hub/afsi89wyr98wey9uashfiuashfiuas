@@ -1,13 +1,11 @@
 import "dotenv/config";
 import { Input, Markup, Telegraf } from "telegraf";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
   ADMIN_IDS,
   BOT_TOKEN,
-  STEAM_WEB_API_KEY,
-  STEAMWEBAPI_BASE_URL,
-  STEAMWEBAPI_KEY,
 } from "./core/config";
 import { adminKb, mainKbForRole } from "./core/ui";
 import { createFileStoreDatabase } from "./core/fileStore";
@@ -21,6 +19,15 @@ type ProfileDrawMode = "add_friend" | "acc_blocked" | "steam_guard_error";
 type UserFlow =
   | { mode: "online_watch_profile_input" }
   | { mode: "online_watch_comment_input"; payload: { profileUrl: string } }
+  | { mode: "rent_add_title" }
+  | { mode: "rent_add_description"; payload: { title: string } }
+  | { mode: "rent_add_credentials"; payload: { title: string; description: string } }
+  | { mode: "rent_add_mafile"; payload: { title: string; description: string; login: string; password: string } }
+  | { mode: "rent_edit_input"; payload: { number: number; field: "title" | "description" } }
+  | { mode: "rent_set_responsible" }
+  | { mode: "rent_discord_handoff"; payload: { rentalNumber: number } }
+  | { mode: "rent_report_upload"; payload: { reportId: number } }
+  | { mode: "rent_report_reject_comment"; payload: { reportId: number; requestRepeat: boolean } }
   | { mode: "settings_phishing_link" }
   | { mode: "admin_logs_search" }
   | { mode: "admin_find_user"; payload: { returnPage: number } }
@@ -28,9 +35,6 @@ type UserFlow =
   | { mode: "draw_input:add_friend"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:acc_blocked"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:steam_guard_error"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
-  | { mode: "draw_input:ban_cs2"; payload: { promptMessageId: number | null } }
-  | { mode: "draw_input:code_cs2"; payload: { variant: "fake" | "not_found"; promptMessageId: number | null } }
-  | { mode: "draw_input:code_cs2_mammoth_code"; payload: { profileUrl: string; promptMessageId: number | null } }
   | { mode: "draw_input:code_dota2_mammoth_code"; payload: { promptMessageId: number | null } }
   | { mode: "draw_input:qr_page_time"; payload: { inviteLink: string; promptMessageId: number | null } }
   | { mode: "draw_input:friend_page_normal_link"; payload: { promptMessageId: number | null } }
@@ -43,21 +47,6 @@ type RuntimeWatch = {
   profileUrl: string;
   comment: string | null;
   lastStatusCheckAt: number;
-};
-
-type SteamProfileData = {
-  name: string;
-  avatarFull: string | null;
-  avatarMedium: string | null;
-  avatarIcon: string | null;
-  avatarFrame: string | null;
-  level: string | null;
-  levelClass: string | null;
-  profilePageHtml: string | null;
-  bodyClass: string | null;
-  headerContentHtml: string | null;
-  badgeHtml: string | null;
-  rightColHtml: string | null;
 };
 
 type InvitePageData = {
@@ -76,19 +65,28 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 const db = createFileStoreDatabase(process.env.STORE_PATH || "./data/bot-store.json") as any;
 const store = db.store;
-
-const LABEL_DRAW = "Отрисовка";
-const LABEL_ONLINE = "Чекер онлайна";
+const DRAW_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "cctg.png");
+const DRAW_ADD_FRIEND_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-add-friend.png");
+const DRAW_QR_PAGE_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-qr-page.png");
+const DRAW_ACC_BLOCKED_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-acc-blocked.png");
+const DRAW_STEAM_GUARD_ERROR_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-steam-guard-error.png");
+const DRAW_CODE_DOTA2_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-code-dota2.png");
+const DRAW_FRIEND_PAGE_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "draw-friend-page.png");
+const WELCOME_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "welcome.png");
+const SETTINGS_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "settings.png");
+const ONLINE_WATCH_IMAGE_PATH = path.join(process.cwd(), "src", "assets", "online-watch.png");
 
 const state = new Map<number, UserFlow>();
 const uiPromptMsg = new Map<number, number>();
 const adminLogsViewState = new Map<number, { query: string }>();
 const onlineWatchRuntime = new Map<number, RuntimeWatch>();
 const onlineWatchProbeState = new Map<number, { lastStatusCheckAt: number; onlineStreak: number }>();
+const activeBroadcasts = new Set<string>();
 let onlineWatchLoopStarted = false;
+let rentReportLoopStarted = false;
+let rentDiscordBridgeLoopStarted = false;
 
 const steamIdResolveCache = new Map<string, { steamId: string; updatedAt: number }>();
-const steamProfileCache = new Map<string, SteamProfileData & { updatedAt: number }>();
 const invitePageCache = new Map<string, InvitePageData & { updatedAt: number }>();
 const STEAM_ABORT_RESOURCE_TYPES = new Set(["media", "font", "websocket"]);
 const STEAM_SCREENSHOT_CLIP_DEFAULT = { x: 0, y: 122, width: 1920, height: 810 };
@@ -131,10 +129,33 @@ function getUserByQuery(queryRaw: string) {
   );
 }
 
+const ROLE_ORDER: Role[] = ["USER", "HELPER", "ADMIN"];
+const ROLE_LABELS: Record<Role, string> = {
+  USER: "Пользователь",
+  HELPER: "Помощник",
+  ADMIN: "Администратор",
+};
+const TOGGLABLE_ROLES: Role[] = ["HELPER", "ADMIN"];
+
+function normalizeRole(roleRaw: unknown): Role | null {
+  const role = String(roleRaw || "").toUpperCase();
+  if (role === "USER" || role === "HELPER" || role === "ADMIN") return role;
+  return null;
+}
+
+function formatRoleList(roles: Role[]) {
+  return roles.map((role) => ROLE_LABELS[role]).join(", ");
+}
+
 function rolesByUserId(userId: number): Role[] {
-  return appState()
-    .user_roles.filter((row: any) => Number(row.user_id) === Number(userId))
-    .map((row: any) => String(row.role)) as Role[];
+  const seen = new Set<Role>(["USER"]);
+  for (const row of appState().user_roles.filter((row: any) => Number(row.user_id) === Number(userId))) {
+    const role = normalizeRole(row.role);
+    if (role) seen.add(role);
+  }
+  const user = getUserById(userId);
+  if (ADMIN_IDS.includes(Number(user?.tg_id || 0))) seen.add("ADMIN");
+  return ROLE_ORDER.filter((role) => seen.has(role));
 }
 
 function ensureUser(ctx: Ctx) {
@@ -174,6 +195,9 @@ function ensureUser(ctx: Ctx) {
 }
 
 function hasRole(user: any, roles: Role[]) {
+  if (roles.includes("ADMIN") && ADMIN_IDS.includes(Number(user?.tg_id || 0))) {
+    return true;
+  }
   return Array.isArray(user?.roles) && user.roles.some((role: Role) => roles.includes(role));
 }
 
@@ -193,6 +217,29 @@ function setUserPhishingLink(userId: number, link: string) {
   saveState();
 }
 
+function hasAcceptedRentRules(userId: number) {
+  const prefs = store.ensureUserPrefs(userId) as any;
+  return Number(prefs.rent_rules_accepted || 0) === 1;
+}
+
+function setRentRulesAccepted(userId: number) {
+  const prefs = store.ensureUserPrefs(userId) as any;
+  prefs.rent_rules_accepted = 1;
+  saveState();
+}
+
+function getRentResponsibleUsername() {
+  const value = String((appState() as any).rent_responsible_username || "").trim();
+  return value || null;
+}
+
+function setRentResponsibleUsername(usernameRaw: string) {
+  const username = String(usernameRaw || "").trim().replace(/^@+/, "");
+  (appState() as any).rent_responsible_username = username ? `@${username}` : null;
+  saveState();
+  return (appState() as any).rent_responsible_username as string | null;
+}
+
 function parseHttpUrl(raw: string) {
   try {
     const parsed = new URL(String(raw || "").trim());
@@ -205,13 +252,34 @@ function parseHttpUrl(raw: string) {
 
 async function renderSettingsMenu(ctx: Ctx, user: any) {
   const phishingLink = getUserPhishingLink(user.id);
-  await replaceOrReply(ctx, `<b>⚙️ Настройки</b>\n\nФишинг-ссылка: <b>${phishingLink ? escapeHtml(phishingLink) : "не установлена"}</b>`, {
+  const caption = `<b>⚙️ Настройки</b>\n\nФишинг-ссылка: <b>${phishingLink ? escapeHtml(phishingLink) : "не установлена"}</b>`;
+  const extra = {
     parse_mode: "HTML",
-    link_preview_options: { is_disabled: true },
     reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback("🔗 Установить фишинг-ссылку", "settings:set_phishing")],
     ]).reply_markup,
-  });
+  };
+
+  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
+    const edited = await ctx
+      .editMessageMedia(
+        {
+          type: "photo",
+          media: Input.fromLocalFile(SETTINGS_IMAGE_PATH),
+          caption,
+          parse_mode: "HTML",
+        },
+        { reply_markup: extra.reply_markup },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (edited) return;
+  }
+
+  await ctx.replyWithPhoto(Input.fromLocalFile(SETTINGS_IMAGE_PATH), {
+    ...extra,
+    caption,
+  }).catch(() => null);
 }
 
 async function askSetPhishingLinkFromDraw(ctx: Ctx) {
@@ -232,16 +300,22 @@ async function getRequiredPhishingLink(ctx: Ctx, user: any) {
   return null;
 }
 
-function formatCountLabel(value: number, singular: string, plural: string) {
-  return `${value} ${value === 1 ? singular : plural}`;
-}
-
 async function showMainMenu(ctx: Ctx, user: any, text?: string) {
   const approvedCount = appState().users.filter((row: any) => Number(row.is_approved || 0) === 1).length;
   const message =
     text ||
     `<tg-emoji emoji-id="5242732781406033436">👋</tg-emoji> Добро пожаловать в <a href="https://discord.gg/criminalchina"><b>CC TEAM BOT</b></a>.\n` +
       `╰ Пользователей в боте: <b>${approvedCount}</b>`;
+  if (!text) {
+    await ctx
+      .replyWithPhoto(Input.fromLocalFile(WELCOME_IMAGE_PATH), {
+        ...getMainKeyboard(user),
+        caption: message,
+        parse_mode: "HTML",
+      })
+      .catch(() => null);
+    return;
+  }
   await ctx
     .reply(message, {
       ...getMainKeyboard(user),
@@ -281,6 +355,13 @@ async function sendCleanPrompt(ctx: Ctx, text: string, extra?: any) {
   const userId = Number(ctx.from?.id || 0);
   const previousMessageId = uiPromptMsg.get(userId);
   if (previousMessageId && ctx.chat?.id) {
+    const edited = await ctx.telegram
+      .editMessageText(ctx.chat.id, previousMessageId, undefined, text, extra)
+      .then(() => true)
+      .catch(() => false);
+    if (edited) {
+      return { message_id: previousMessageId };
+    }
     await ctx.telegram.deleteMessage(ctx.chat.id, previousMessageId).catch(() => null);
   }
   const sent = await ctx.reply(text, extra).catch(() => null);
@@ -290,17 +371,50 @@ async function sendCleanPrompt(ctx: Ctx, text: string, extra?: any) {
   return sent;
 }
 
-async function sendPersistentPrompt(ctx: Ctx, text: string, extra?: any) {
-  return await ctx.reply(text, extra).catch(() => null);
-}
-
 async function replaceOrReply(ctx: Ctx, text: string, extra?: any) {
   if (ctx.updateType === "callback_query" && typeof ctx.editMessageText === "function") {
     const edited = await ctx.editMessageText(text, extra).then(() => true).catch(() => false);
     if (edited) return true;
+    if (typeof ctx.editMessageCaption === "function") {
+      const captionEdited = await ctx.editMessageCaption(text, extra).then(() => true).catch(() => false);
+      if (captionEdited) return true;
+    }
   }
   await ctx.reply(text, extra).catch(() => null);
   return false;
+}
+
+async function renderPhotoPrompt(ctx: Ctx, imagePath: string, caption: string, extra?: any) {
+  const mediaExtra = extra?.reply_markup ? { reply_markup: extra.reply_markup } : undefined;
+
+  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
+    const editedMedia = await ctx
+      .editMessageMedia(
+        {
+          type: "photo",
+          media: Input.fromLocalFile(imagePath),
+          caption,
+          parse_mode: extra?.parse_mode,
+        },
+        mediaExtra,
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (editedMedia) return true;
+  }
+
+  if (ctx.updateType === "callback_query" && typeof ctx.editMessageCaption === "function") {
+    const editedCaption = await ctx.editMessageCaption(caption, extra).then(() => true).catch(() => false);
+    if (editedCaption) return true;
+  }
+
+  await ctx.replyWithPhoto(Input.fromLocalFile(imagePath), {
+    ...(extra || {}),
+    caption,
+  }).catch(async () => {
+    await replaceOrReply(ctx, caption, extra);
+  });
+  return true;
 }
 
 function normalizeProfileInput(input: string): { profileUrl: string; steamId: string | null } | null {
@@ -335,23 +449,19 @@ function normalizeProfileInput(input: string): { profileUrl: string; steamId: st
 
 async function fetchTextSafe(url: string) {
   try {
-    const res = await fetch(url, {
+    const preparedUrl = new URL(url);
+    preparedUrl.searchParams.set("_", String(Date.now()));
+    const res = await fetch(preparedUrl.toString(), {
       redirect: "follow",
-      headers: { "User-Agent": "Mozilla/5.0" },
+      headers: {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      },
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
     return await res.text();
-  } catch {
-    return null;
-  }
-}
-
-async function fetchJsonSafe(url: string) {
-  const text = await fetchTextSafe(url);
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
   } catch {
     return null;
   }
@@ -373,61 +483,60 @@ async function resolveSteamId64FromProfileUrl(profileUrl: string) {
   const vanity = normalized.match(/\/id\/([A-Za-z0-9_-]{2,64})\/?$/i)?.[1];
   if (!vanity) return null;
 
-  if (STEAM_WEB_API_KEY) {
-    const apiUrl = new URL("https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/");
-    apiUrl.searchParams.set("key", STEAM_WEB_API_KEY);
-    apiUrl.searchParams.set("vanityurl", vanity);
-    const json = await fetchJsonSafe(apiUrl.toString());
-    const steamId = String(json?.response?.steamid || "").trim();
-    if (/^7\d{15,18}$/.test(steamId)) {
-      steamIdResolveCache.set(normalized, { steamId, updatedAt: Date.now() });
-      return steamId;
-    }
+  const xml = await fetchTextSafe(`${normalized.replace(/\/+$/, "/")}?xml=1`);
+  const xmlSteamId = xml?.match(/<steamID64>\s*(7\d{15,18})\s*<\/steamID64>/i)?.[1] || null;
+  if (xmlSteamId) {
+    steamIdResolveCache.set(normalized, { steamId: xmlSteamId, updatedAt: Date.now() });
+    return xmlSteamId;
   }
 
-  const xml = await fetchTextSafe(`${normalized.replace(/\/+$/, "/")}?xml=1`);
-  const steamId = xml?.match(/<steamID64>\s*(7\d{15,18})\s*<\/steamID64>/i)?.[1] || null;
-  if (steamId) {
-    steamIdResolveCache.set(normalized, { steamId, updatedAt: Date.now() });
-  }
-  return steamId;
+  return null;
+}
+
+function parseSteamOnlineStateFromXml(xml: string) {
+  const rawState = String(xml.match(/<onlineState>\s*([^<]+)\s*<\/onlineState>/i)?.[1] || "").trim().toLowerCase();
+  if (!rawState) return null;
+  if (rawState === "offline") return false;
+  return true;
+}
+
+function parseSteamOnlineStateFromHtml(html: string) {
+  const bodyClass = String(html.match(/<body[^>]*class=["']([^"']+)["']/i)?.[1] || "").toLowerCase();
+  const personaClass = String(html.match(/class=["'][^"']*\bpersona\s+([^"']*)["']/i)?.[1] || "").toLowerCase();
+  const playerAvatarClass = String(html.match(/class=["'][^"']*\bplayeravatar\s+([^"']*)["']/i)?.[1] || "").toLowerCase();
+  const combined = `${bodyClass} ${personaClass} ${playerAvatarClass}`;
+  if (/\boffline\b/.test(combined)) return false;
+  if (/\b(online|in-game|ingame|away|busy|snooze)\b/.test(combined)) return true;
+  if (/profile_in_game_header|profile_in_game_name|currently online|currently in-game/i.test(html)) return true;
+  return null;
 }
 
 async function detectSteamProfileOnline(profileUrl: string): Promise<boolean | null> {
-  if (STEAMWEBAPI_KEY) {
-    const normalized = normalizeProfileInput(profileUrl);
-    const idParam = normalized?.steamId || normalized?.profileUrl || profileUrl;
-    const apiUrl = new URL("/steam/api/profile", `${STEAMWEBAPI_BASE_URL}/`);
-    apiUrl.searchParams.set("key", STEAMWEBAPI_KEY);
-    apiUrl.searchParams.set("id", idParam);
-    apiUrl.searchParams.set("format", "json");
-    apiUrl.searchParams.set("production", "1");
-    apiUrl.searchParams.set("no_cache", "1");
-    const json = await fetchJsonSafe(apiUrl.toString());
-    const onlineState = String(json?.onlinestate || "").trim().toLowerCase();
-    if (onlineState) {
-      return onlineState !== "offline";
-    }
+  const normalized = normalizeProfileInput(profileUrl);
+  const normalizedUrl = normalized?.profileUrl || profileUrl;
+  const steamId = normalized?.steamId || (await resolveSteamId64FromProfileUrl(normalizedUrl));
+
+  const xmlUrl = steamId
+    ? `https://steamcommunity.com/profiles/${steamId}/?xml=1`
+    : `${normalizedUrl.replace(/\/+$/, "")}/?xml=1`;
+  const xml = await fetchTextSafe(xmlUrl);
+  if (xml) {
+    const parsedXmlState = parseSteamOnlineStateFromXml(xml);
+    if (parsedXmlState !== null) return parsedXmlState;
   }
 
-  const steamId = await resolveSteamId64FromProfileUrl(profileUrl);
-  if (!steamId) return null;
+  const htmlTargets = [
+    normalizedUrl,
+    steamId ? `https://steamcommunity.com/profiles/${steamId}/` : null,
+  ].filter(Boolean) as string[];
 
-  if (STEAM_WEB_API_KEY) {
-    const apiUrl = new URL("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/");
-    apiUrl.searchParams.set("key", STEAM_WEB_API_KEY);
-    apiUrl.searchParams.set("steamids", steamId);
-    const json = await fetchJsonSafe(apiUrl.toString());
-    const stateValue = Number(json?.response?.players?.[0]?.personastate);
-    if (!Number.isNaN(stateValue)) {
-      return stateValue > 0;
-    }
+  for (const target of htmlTargets) {
+    const html = await fetchTextSafe(target);
+    if (!html) continue;
+    const parsedHtmlState = parseSteamOnlineStateFromHtml(html);
+    if (parsedHtmlState !== null) return parsedHtmlState;
   }
 
-  const xml = await fetchTextSafe(`https://steamcommunity.com/profiles/${steamId}/?xml=1`);
-  if (!xml) return null;
-  if (/<onlineState>\s*online\s*<\/onlineState>/i.test(xml)) return true;
-  if (/<onlineState>\s*offline\s*<\/onlineState>/i.test(xml)) return false;
   return null;
 }
 
@@ -611,11 +720,17 @@ async function renderAdminUserCard(ctx: Ctx, target: any, page: number) {
     `<b>Пользователь #${target.id}</b>`,
     `Telegram: <b>${escapeHtml(target.tg_username ? `@${target.tg_username}` : String(target.tg_id || "-"))}</b>`,
     `Discord: <b>${escapeHtml(String(target.discord_tag || "-"))}</b>`,
-    `Роли: <b>${escapeHtml(roles.length ? roles.join(", ") : "USER")}</b>`,
+    `Роли: <b>${escapeHtml(formatRoleList(roles))}</b>`,
     `Статус: <b>${Number(target.is_banned || 0) ? "Забанен" : "Активен"}</b>`,
     `Регистрация: <b>${escapeHtml(formatAdminListDate(target.registered_at))}</b>`,
   ];
   const kb = Markup.inlineKeyboard([
+    TOGGLABLE_ROLES.map((role) =>
+      Markup.button.callback(
+        `${roles.includes(role) ? "✓ " : "+ "}${ROLE_LABELS[role]}`,
+        `admin:role:${target.id}:${role}:${page}`,
+      ),
+    ),
     [Markup.button.callback(Number(target.is_banned || 0) ? "Разбанить" : "Забанить", `admin:ban:${target.id}:${page}`)],
     [Markup.button.callback("Назад", `admin:userlist:page:${page}`)],
   ]).reply_markup;
@@ -782,6 +897,47 @@ function toggleUserBan(userId: number) {
   return user;
 }
 
+function toggleUserRole(userId: number, role: Role) {
+  if (!TOGGLABLE_ROLES.includes(role)) return null;
+  const user = getUserById(userId);
+  if (!user) return null;
+
+  const roles = appState().user_roles as Array<{ id: number; user_id: number; role: string }>;
+  const matchesRole = (row: { user_id: number; role: string }) => {
+    if (Number(row.user_id) !== Number(userId)) return false;
+    const currentRole = String(row.role).toUpperCase();
+    return currentRole === role;
+  };
+  const hasRoleAlready = roles.some(matchesRole);
+
+  for (let index = roles.length - 1; index >= 0; index -= 1) {
+    if (matchesRole(roles[index])) roles.splice(index, 1);
+  }
+
+  if (!hasRoleAlready) {
+    const nextRoleId = roles.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
+    roles.push({ id: nextRoleId, user_id: Number(userId), role });
+  }
+
+  if (!roles.some((row) => Number(row.user_id) === Number(userId) && String(row.role).toUpperCase() === "USER")) {
+    const nextRoleId = roles.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
+    roles.push({ id: nextRoleId, user_id: Number(userId), role: "USER" });
+  }
+
+  if (ADMIN_IDS.includes(Number(user.tg_id || 0))) {
+    if (!roles.some((row) => Number(row.user_id) === Number(userId) && String(row.role).toUpperCase() === "ADMIN")) {
+      const nextRoleId = roles.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
+      roles.push({ id: nextRoleId, user_id: Number(userId), role: "ADMIN" });
+    }
+    user.is_approved = 1;
+  } else {
+    const normalizedRoles = rolesByUserId(userId);
+    user.is_approved = normalizedRoles.includes("ADMIN") ? 1 : Number(user.is_approved || 0);
+  }
+  saveState();
+  return user;
+}
+
 function broadcastRecipients() {
   const seen = new Set<number>();
   const result: number[] = [];
@@ -798,74 +954,178 @@ function waitMs(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getBroadcastKey(sourceChatId: number, sourceMessageId: number) {
+  return `source:${sourceChatId}:${sourceMessageId}`;
+}
+
+function getBroadcastLog(eventType: string, broadcastKey: string) {
+  return (
+    (appState().logs as any[]).find(
+      (row) => String(row.event_type || "") === eventType && String(row.details || "").startsWith(broadcastKey),
+    ) || null
+  );
+}
+
 async function sendAdminBroadcast(ctx: Ctx, me: any) {
   const sourceChatId = ctx.chat?.id;
   const sourceMessageId = ctx.message?.message_id;
   if (!sourceChatId || !sourceMessageId) return false;
 
+  const broadcastKey = getBroadcastKey(Number(sourceChatId), Number(sourceMessageId));
+  if (activeBroadcasts.has(broadcastKey)) {
+    state.delete(ctx.from.id);
+    await ctx.reply("<b>Эта рассылка уже выполняется.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return true;
+  }
+  if (getBroadcastLog("admin_broadcast_done", broadcastKey)) {
+    state.delete(ctx.from.id);
+    await ctx.reply("<b>Эта рассылка уже была завершена. Повтор не запущен.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return true;
+  }
+  if (getBroadcastLog("admin_broadcast_start", broadcastKey)) {
+    state.delete(ctx.from.id);
+    await ctx.reply("<b>Эта рассылка уже запускалась. Повтор после рестарта заблокирован.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return true;
+  }
+
   state.delete(ctx.from.id);
+  logEvent(me, "admin_broadcast_start", broadcastKey);
+  saveState();
+  activeBroadcasts.add(broadcastKey);
+
   const recipients = broadcastRecipients();
-  let sent = 0;
-  let failed = 0;
   const status = await ctx.reply(`<b>Рассылка запущена.</b>\nПолучателей: <b>${recipients.length}</b>`, { parse_mode: "HTML" }).catch(() => null);
 
-  for (const tgId of recipients) {
+  void (async () => {
+    let sent = 0;
+    let failed = 0;
     try {
-      await ctx.telegram.copyMessage(tgId, sourceChatId, sourceMessageId);
-      sent += 1;
-    } catch {
-      failed += 1;
-    }
-    if ((sent + failed) % 20 === 0) {
-      await waitMs(900);
-    } else {
-      await waitMs(35);
-    }
-  }
+      for (const tgId of recipients) {
+        try {
+          await ctx.telegram.copyMessage(tgId, sourceChatId, sourceMessageId);
+          sent += 1;
+        } catch {
+          failed += 1;
+        }
+        if ((sent + failed) % 20 === 0) {
+          await waitMs(900);
+        } else {
+          await waitMs(35);
+        }
+      }
 
-  const resultText = `<b>Рассылка завершена.</b>\nОтправлено: <b>${sent}</b>\nОшибок: <b>${failed}</b>`;
-  if (status?.message_id) {
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, resultText, { parse_mode: "HTML" }).catch(() => null);
-  } else {
-    await ctx.reply(resultText, { parse_mode: "HTML" }).catch(() => null);
-  }
-  logEvent(me, "admin_broadcast", `sent:${sent}:failed:${failed}`);
+      const resultText = `<b>Рассылка завершена.</b>\nОтправлено: <b>${sent}</b>\nОшибок: <b>${failed}</b>`;
+      if (status?.message_id) {
+        await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, resultText, { parse_mode: "HTML" }).catch(() => null);
+      } else {
+        await ctx.reply(resultText, { parse_mode: "HTML" }).catch(() => null);
+      }
+      logEvent(me, "admin_broadcast_done", `${broadcastKey}:sent:${sent}:failed:${failed}`);
+    } catch (error) {
+      console.error("[BROADCAST ERROR]", error);
+      const resultText = `<b>Рассылка остановлена с ошибкой.</b>\nОтправлено: <b>${sent}</b>\nОшибок: <b>${failed}</b>`;
+      if (status?.message_id) {
+        await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, resultText, { parse_mode: "HTML" }).catch(() => null);
+      } else {
+        await ctx.reply(resultText, { parse_mode: "HTML" }).catch(() => null);
+      }
+      logEvent(me, "admin_broadcast_failed", `${broadcastKey}:sent:${sent}:failed:${failed}`);
+    } finally {
+      activeBroadcasts.delete(broadcastKey);
+    }
+  })();
+
   return true;
 }
 
 async function renderDrawMenu(ctx: Ctx) {
-  await replaceOrReply(
-    ctx,
-    `<tg-emoji emoji-id="5242657215751426928">🎨</tg-emoji> <b>Отрисовка.</b> Позволяет максимально быстро создать нужный шаблон под рабочие задачи.`,
-    {
-      parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback("👥 Добавление в друзья", "draw:add_friend")],
-        [Markup.button.callback("🧾 Страница друга", "draw:friend_page")],
-        [Markup.button.callback("🔳 QR-Код страница друга", "draw:qr_page")],
-        [Markup.button.callback("⛔ Аккаунт заблокирован", "draw:acc_blocked")],
-        [Markup.button.callback("🛡️ Ошибка Steam Guard", "draw:steam_guard_error")],
-        [Markup.button.callback("🚫 Бан CS2", "draw:ban_cs2")],
-        [Markup.button.callback("🔑 Код CS2", "draw:code_cs2")],
-        [Markup.button.callback("🔑 Код DOTA 2", "draw:code_dota2")],
-      ]).reply_markup,
-    },
-  );
+  const text = `<tg-emoji emoji-id="5242657215751426928">🎨</tg-emoji> <b>Отрисовка.</b> Позволяет максимально быстро создать нужный шаблон под рабочие задачи.`;
+  const extra = {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("👥 Добавление в друзья", "draw:add_friend")],
+      [Markup.button.callback("🧾 Страница друга", "draw:friend_page")],
+      [Markup.button.callback("🔳 QR-Код страница друга", "draw:qr_page")],
+      [Markup.button.callback("⛔ Аккаунт заблокирован", "draw:acc_blocked")],
+      [Markup.button.callback("🛡️ Ошибка Steam Guard", "draw:steam_guard_error")],
+      [Markup.button.callback("🔑 Код DOTA 2", "draw:code_dota2")],
+    ]).reply_markup,
+  };
+
+  if (ctx.updateType === "callback_query") {
+    if (typeof ctx.editMessageMedia === "function") {
+      const editedMedia = await ctx
+        .editMessageMedia(
+          {
+            type: "photo",
+            media: Input.fromLocalFile(DRAW_IMAGE_PATH),
+            caption: text,
+            parse_mode: "HTML",
+          },
+          { reply_markup: extra.reply_markup },
+        )
+        .then(() => true)
+        .catch(() => false);
+      if (editedMedia) return;
+    }
+
+    const editedCaption = typeof ctx.editMessageCaption === "function"
+      ? await ctx.editMessageCaption(text, extra).then(() => true).catch(() => false)
+      : false;
+    if (editedCaption) return;
+
+    const editedText = typeof ctx.editMessageText === "function"
+      ? await ctx.editMessageText(text, extra).then(() => true).catch(() => false)
+      : false;
+    if (editedText) return;
+  }
+
+  try {
+    await ctx.replyWithPhoto(Input.fromLocalFile(DRAW_IMAGE_PATH), {
+      ...extra,
+      caption: text,
+    });
+  } catch {
+    await replaceOrReply(ctx, text, extra);
+  }
 }
 
-async function runDrawJob(ctx: Ctx, job: () => Promise<string>, errorMessage: string) {
+async function runDrawJob(ctx: Ctx, job: () => Promise<string>, errorMessage: string, statusMessageId = 0) {
   let ticker: NodeJS.Timeout | null = null;
-  let drawMessageId = 0;
+  let drawMessageId = statusMessageId;
   let screenshotPath = "";
   try {
     const frames = ["Рисую.", "Рисую..", "Рисую..."] as const;
     let frameIndex = 0;
     const statusText = () => `<b>${frames[frameIndex]}</b>`;
-    const statusMessage = await ctx.reply(statusText(), { parse_mode: "HTML" });
-    drawMessageId = statusMessage.message_id;
+    const editDrawStatus = async (messageId: number) => {
+      if (!ctx.chat?.id) return false;
+      const editedText = await ctx.telegram
+        .editMessageText(ctx.chat.id, messageId, undefined, statusText(), { parse_mode: "HTML" })
+        .then(() => true)
+        .catch(() => false);
+      if (editedText) return true;
+      return await ctx.telegram
+        .editMessageCaption(ctx.chat.id, messageId, undefined, statusText(), { parse_mode: "HTML" })
+        .then(() => true)
+        .catch(() => false);
+    };
+
+    if (drawMessageId > 0 && ctx.chat?.id) {
+      const editedStatus = await editDrawStatus(drawMessageId);
+      if (!editedStatus) {
+        drawMessageId = 0;
+      }
+    }
+
+    if (!drawMessageId) {
+      const statusMessage = await ctx.reply(statusText(), { parse_mode: "HTML" });
+      drawMessageId = statusMessage.message_id;
+    }
+
     ticker = setInterval(async () => {
       frameIndex = (frameIndex + 1) % frames.length;
-      await ctx.telegram.editMessageText(ctx.chat.id, drawMessageId, undefined, statusText(), { parse_mode: "HTML" }).catch(() => null);
+      await editDrawStatus(drawMessageId);
     }, 800);
 
     screenshotPath = await job();
@@ -873,15 +1133,44 @@ async function runDrawJob(ctx: Ctx, job: () => Promise<string>, errorMessage: st
       clearInterval(ticker);
       ticker = null;
     }
-    await ctx.deleteMessage(drawMessageId).catch(() => null);
-    await ctx.replyWithDocument(Input.fromLocalFile(screenshotPath, `IMG_${Date.now()}.png`));
+
+    const editedDocument = drawMessageId > 0 && ctx.chat?.id
+      ? await ctx.telegram
+          .editMessageMedia(
+            ctx.chat.id,
+            drawMessageId,
+            undefined,
+            { type: "document", media: Input.fromLocalFile(screenshotPath, `IMG_${Date.now()}.png`) } as any,
+          )
+          .then(() => true)
+          .catch(() => false)
+      : false;
+
+    if (!editedDocument) {
+      if (drawMessageId) {
+        await ctx.deleteMessage(drawMessageId).catch(() => null);
+      }
+      await ctx.replyWithDocument(Input.fromLocalFile(screenshotPath, `IMG_${Date.now()}.png`));
+    }
     return true;
   } catch {
     if (ticker) clearInterval(ticker);
-    if (drawMessageId) {
-      await ctx.deleteMessage(drawMessageId).catch(() => null);
+    let editedError = false;
+    if (drawMessageId > 0 && ctx.chat?.id) {
+      editedError = await ctx.telegram
+        .editMessageText(ctx.chat.id, drawMessageId, undefined, errorMessage)
+        .then(() => true)
+        .catch(() => false);
+      if (!editedError) {
+        editedError = await ctx.telegram
+          .editMessageCaption(ctx.chat.id, drawMessageId, undefined, errorMessage)
+          .then(() => true)
+          .catch(() => false);
+      }
     }
-    await ctx.reply(errorMessage).catch(() => null);
+    if (!editedError) {
+      await ctx.reply(errorMessage).catch(() => null);
+    }
     return false;
   } finally {
     if (screenshotPath) {
@@ -908,9 +1197,14 @@ function makeProfileDrawScreenshot(
 
 async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string }>, rawText: string) {
   const promptMessageId = Number((flow as any).payload?.promptMessageId || 0);
-  if (promptMessageId > 0) {
-    await ctx.telegram.deleteMessage(ctx.chat.id, promptMessageId).catch(() => null);
-  }
+  const editPromptOrReply = async (message: string) => {
+    const edited = promptMessageId > 0 && ctx.chat?.id
+      ? await ctx.telegram.editMessageText(ctx.chat.id, promptMessageId, undefined, message).then(() => true).catch(() => false)
+      : false;
+    if (!edited) {
+      await ctx.reply(message).catch(() => null);
+    }
+  };
   if (ctx.message?.message_id) {
     await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => null);
   }
@@ -921,7 +1215,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
   if (mode === "friend_page_normal_link") {
     const parsed = parseHttpUrl(text);
     if (!parsed) {
-      await ctx.reply("Нужна корректная фишинг-ссылка http/https.");
+      await editPromptOrReply("Нужна корректная фишинг-ссылка http/https.");
       return;
     }
     state.delete(ctx.from.id);
@@ -929,6 +1223,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       ctx,
       () => makeSteamFriendPageFromTemplateScreenshot(parsed, { variant: "normal" }),
       "Не удалось создать страницу друга.",
+      promptMessageId,
     );
     return;
   }
@@ -936,11 +1231,11 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
   if (mode === "qr_page_time") {
     const inviteLink = String((flow as any).payload?.inviteLink || "");
     if (!inviteLink || !text) {
-      await ctx.reply("Время не должно быть пустым.");
+      await editPromptOrReply("Время не должно быть пустым.");
       return;
     }
     state.delete(ctx.from.id);
-    await runDrawJob(ctx, () => makeSteamQrPageScreenshot(text, inviteLink), "Не удалось создать QR-страницу.");
+    await runDrawJob(ctx, () => makeSteamQrPageScreenshot(text, inviteLink), "Не удалось создать QR-страницу.", promptMessageId);
     return;
   }
 
@@ -948,7 +1243,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
     const inviteLink = String((flow as any).payload?.inviteLink || "");
     const showRegionMismatch = Boolean((flow as any).payload?.showRegionMismatch);
     if (!inviteLink || !text) {
-      await ctx.reply("Код друга не должен быть пустым.");
+      await editPromptOrReply("Код друга не должен быть пустым.");
       return;
     }
     state.delete(ctx.from.id);
@@ -956,28 +1251,14 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       ctx,
       () => makeSteamFriendPageFromTemplateScreenshot(inviteLink, { variant: "not_found", friendCode: text, showRegionMismatch }),
       "Не удалось создать страницу друга.",
-    );
-    return;
-  }
-
-  if (mode === "code_cs2_mammoth_code") {
-    const profileUrl = String((flow as any).payload?.profileUrl || "");
-    if (!profileUrl || !text) {
-      await ctx.reply("Код CS2 не должен быть пустым.");
-      return;
-    }
-    state.delete(ctx.from.id);
-    await runDrawJob(
-      ctx,
-      () => makeSteamCodeCs2NotFoundScreenshot(profileUrl, text),
-      "Не удалось создать скриншот кода CS2.",
+      promptMessageId,
     );
     return;
   }
 
   if (mode === "code_dota2_mammoth_code") {
     if (!text) {
-      await ctx.reply("Код DOTA 2 не должен быть пустым.");
+      await editPromptOrReply("Код DOTA 2 не должен быть пустым.");
       return;
     }
     state.delete(ctx.from.id);
@@ -985,24 +1266,16 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       ctx,
       () => makeDota2CodeNotFoundScreenshot(text),
       "Не удалось создать скриншот кода DOTA 2.",
+      promptMessageId,
     );
     return;
   }
 
   const normalized = normalizeProfileInput(text);
   if (!normalized) {
-    await ctx.reply(
+    await editPromptOrReply(
       "Нужен SteamID или ссылка вида:\nhttps://steamcommunity.com/profiles/7656...\nhttps://steamcommunity.com/id/name/",
     );
-    return;
-  }
-
-  if (mode === "code_cs2" && (flow as any).payload?.variant === "not_found") {
-    const sent = await ctx.reply(`<b>Введите код CS2 мамонта.</b>`, { parse_mode: "HTML" });
-    state.set(ctx.from.id, {
-      mode: "draw_input:code_cs2_mammoth_code",
-      payload: { profileUrl: normalized.profileUrl, promptMessageId: sent.message_id },
-    });
     return;
   }
 
@@ -1018,6 +1291,7 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
       ctx,
       () => makeProfileDrawScreenshot(normalized.profileUrl, mode, variant, phishingLink),
       "Не удалось создать скриншот.",
+      promptMessageId,
     );
     return;
   }
@@ -1025,22 +1299,737 @@ async function handleDrawInput(ctx: Ctx, flow: Extract<UserFlow, { mode: string 
   state.delete(ctx.from.id);
   await runDrawJob(
     ctx,
-    async () => {
-      if (mode === "ban_cs2") {
-        return makeSteamBanCs2Screenshot(normalized.profileUrl);
-      }
-      if (mode === "code_cs2") {
-        return makeSteamCodeCs2Screenshot(normalized.profileUrl);
-      }
-      return makeSteamProfileScreenshot(normalized.profileUrl);
-    },
+    () => makeSteamProfileScreenshot(normalized.profileUrl),
     "Не удалось создать скриншот.",
+    promptMessageId,
   );
 }
 
 function syncStateForRemovedWatch(watchId: number) {
   onlineWatchRuntime.delete(watchId);
   onlineWatchProbeState.delete(watchId);
+}
+
+function onlineWatchMenuMarkup() {
+  return Markup.inlineKeyboard([[Markup.button.callback("📋 Список аккаунтов", "online_watch:list")]]).reply_markup;
+}
+
+function getOnlineWatchRowsForUser(userId: number) {
+  return (appState().online_watch as any[])
+    .filter((row) => Number(row.user_id) === Number(userId))
+    .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+}
+
+async function renderOnlineWatchPrompt(ctx: Ctx) {
+  const caption = `<tg-emoji emoji-id="5242657215751426928">🟢</tg-emoji> <b>Чекер онлайна.</b> Отправляет уведомление, когда нужный профиль появляется в сети\n\n<tg-emoji emoji-id="5240446651918753852">🔗</tg-emoji> Пришлите ссылку на профиль/SteamID`;
+  const extra = {
+    parse_mode: "HTML",
+    reply_markup: onlineWatchMenuMarkup(),
+  };
+
+  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
+    const edited = await ctx
+      .editMessageMedia(
+        {
+          type: "photo",
+          media: Input.fromLocalFile(ONLINE_WATCH_IMAGE_PATH),
+          caption,
+          parse_mode: "HTML",
+        },
+        { reply_markup: extra.reply_markup },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (edited) return;
+  }
+
+  await ctx.replyWithPhoto(Input.fromLocalFile(ONLINE_WATCH_IMAGE_PATH), {
+    ...extra,
+    caption,
+  }).catch(() => null);
+}
+
+async function renderRentalsMenu(ctx: Ctx) {
+  await renderRentalsList(ctx, ensureUser(ctx));
+}
+
+async function renderRentalsRules(ctx: Ctx) {
+  const availableAt = Date.now() + 30_000;
+  const text =
+    `<b>🧾 Условия аренды аккаунта</b>\n\n` +
+    `Перед входом в раздел подтвердите правила:\n\n` +
+    `1. <b>Ежедневная активность:</b> минимум <b>10 игр Turbo</b> или <b>5 игр Rating</b> в день.\n` +
+    `2. <b>Ежедневный отчет:</b> каждый день в <b>20:00 МСК</b> нужно отправлять скрин списка игр.\n` +
+    `3. <b>Отчеты обязательны:</b> если отчет не будет отправлен <b>2 раза за 7 дней</b>, аренда аккаунта будет отменена.\n` +
+    `4. <b>Игры нельзя портить:</b> запрещены ливы, руин и любые действия, которые снижают порядочность аккаунта. За серьезный вред аккаунту доступ к аренде блокируется навсегда.\n` +
+    `5. <b>Steam-ссылки запрещены:</b> нельзя отправлять ссылки в Steam Chat. Общение и переходы в Steam Chat выполняются самостоятельно, без рассылки ссылок.`;
+
+  await renderPhotoPrompt(ctx, WELCOME_IMAGE_PATH, text, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("✅ Я понял, открыть аренду", `rent:rules_accept:${availableAt}`)],
+    ]).reply_markup,
+  });
+}
+
+function canManageRentals(user: any) {
+  return hasRole(user, ["HELPER", "ADMIN"]);
+}
+
+function rentalRows() {
+  return (appState().rentals as any[])
+    .slice()
+    .sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+}
+
+function getRentalByNumber(number: number) {
+  return (appState().rentals as any[]).find((row) => Number(row.number) === Number(number)) || null;
+}
+
+function getRentalById(id: number) {
+  return (appState().rentals as any[]).find((row) => Number(row.id) === Number(id)) || null;
+}
+
+function userLabel(user: any) {
+  if (!user) return "-";
+  return user.tg_username ? `@${user.tg_username}` : String(user.tg_id || user.id || "-");
+}
+
+function rentalListLabel(row: any) {
+  const status = Number(row.is_busy || 0) ? "🔴" : "🟢";
+  return `${status} ${String(row.title || `Аккаунт #${row.number}`)} №${row.number}`;
+}
+
+function formatDiscordRentalCommand(rental: any) {
+  return `/ar ${Number(rental.number)}`;
+}
+
+function formatDiscordRentalInstruction(rental: any) {
+  return (
+    `<b>Заявка почти готова.</b>\n\n` +
+    `Чтобы подтвердить Discord, зайдите на сервер и отправьте команду в канале <code>1532708640513986562</code>:\n\n` +
+    `<code>${escapeHtml(formatDiscordRentalCommand(rental))}</code>\n\n` +
+    `После подтверждения заявка уйдет администраторам и помощникам уже с вашим Discord.`
+  );
+}
+
+function nextRentalNumber() {
+  return rentalRows().reduce((max, row) => Math.max(max, Number(row.number || 0)), 0) + 1;
+}
+
+function nextRowId(rows: any[]) {
+  return rows.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
+}
+
+function moscowNowParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const value = (type: string) => parts.find((part) => part.type === type)?.value || "00";
+  return {
+    dateKey: `${value("year")}-${value("month")}-${value("day")}`,
+    hour: Number(value("hour")),
+    minute: Number(value("minute")),
+  };
+}
+
+function activeRentalRows() {
+  return (appState().rentals as any[]).filter((row) => Number(row.is_busy || 0) === 1 && Number(row.rented_by_user_id || 0));
+}
+
+function rentReports() {
+  const stateData = appState();
+  if (!Array.isArray(stateData.rent_reports)) stateData.rent_reports = [];
+  return stateData.rent_reports as any[];
+}
+
+function rentDiscordPendingRows() {
+  const stateData = appState();
+  if (!Array.isArray(stateData.rent_discord_pending)) stateData.rent_discord_pending = [];
+  return stateData.rent_discord_pending as any[];
+}
+
+function createRentDiscordPending(rental: any, user: any) {
+  const rows = rentDiscordPendingRows();
+  for (const row of rows) {
+    if (
+      Number(row.rental_number) === Number(rental.number) &&
+      Number(row.tg_user_id) === Number(user.id) &&
+      String(row.status || "") === "PENDING"
+    ) {
+      row.updated_at = nowIso();
+      saveState();
+      return row;
+    }
+  }
+  const row = {
+    id: nextRowId(rows),
+    rental_id: Number(rental.id),
+    rental_number: Number(rental.number),
+    tg_user_id: Number(user.id),
+    tg_id: Number(user.tg_id || 0),
+    status: "PENDING",
+    discord_user_id: null,
+    discord_username: null,
+    discord_display_name: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    processed_at: null,
+  };
+  rows.push(row);
+  saveState();
+  return row;
+}
+
+function getRentReportById(reportId: number) {
+  return rentReports().find((row) => Number(row.id) === Number(reportId)) || null;
+}
+
+function cancelRental(rental: any) {
+  if (!rental) return false;
+  const renterId = Number(rental.rented_by_user_id || 0);
+  rental.is_busy = 0;
+  rental.rented_by_user_id = null;
+  rental.report_deadline_at = null;
+  rental.last_report_date = null;
+  rental.last_report_message_id = null;
+  rental.report_misses = [];
+  appState().guard_attempts = (appState().guard_attempts as any[]).filter(
+    (row) => Number(row.rental_id) !== Number(rental.id) || Number(row.user_id) !== renterId,
+  );
+  saveState();
+  return true;
+}
+
+function markRentalReportMiss(rental: any) {
+  const now = Date.now();
+  const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const misses = Array.isArray(rental.report_misses) ? rental.report_misses : [];
+  rental.report_misses = misses
+    .map((value: any) => Date.parse(String(value)))
+    .filter((value: number) => Number.isFinite(value) && value >= weekAgo)
+    .map((value: number) => new Date(value).toISOString());
+  rental.report_misses.push(new Date(now).toISOString());
+  return rental.report_misses.length;
+}
+
+async function notifyRentalCanceled(ctx: Ctx, rental: any, reason: string) {
+  const renter = getUserById(Number(rental?.rented_by_user_id || 0));
+  cancelRental(rental);
+  if (renter?.tg_id) {
+    await ctx.telegram.sendMessage(
+      Number(renter.tg_id),
+      `<b>Аренда аккаунта №${rental.number} отменена.</b>\n${escapeHtml(reason)}`,
+      { parse_mode: "HTML" },
+    ).catch(() => null);
+  }
+}
+
+function rentalBackButton() {
+  return Markup.button.callback("⬅️ Назад", "rent:list");
+}
+
+async function renderRentalsList(ctx: Ctx, user: any) {
+  const rows = rentalRows();
+  const keyboardRows = rows.map((row) => [
+    Markup.button.callback(rentalListLabel(row), `rent:view:${row.number}`),
+  ]);
+  if (canManageRentals(user)) {
+    keyboardRows.push([Markup.button.callback("⚙️ Управление", "rent:manage")]);
+  }
+
+  const responsible = getRentResponsibleUsername() || "не назначен";
+  const caption = rows.length
+    ? `<tg-emoji emoji-id="5242657215751426928">🧾</tg-emoji> <b>Аренда аккаунтов.</b> Выберите аккаунт из списка\n\n<tg-emoji emoji-id="5240026767325961445">👤</tg-emoji> Ответственный: <b>${escapeHtml(responsible)}</b>\n\n<tg-emoji emoji-id="5242655665268232103">🔗</tg-emoji> Нажмите на нужный аккаунт ниже`
+    : `<tg-emoji emoji-id="5242657215751426928">🧾</tg-emoji> <b>Аренда аккаунтов.</b> Аккаунтов для аренды пока нет.\n\n<tg-emoji emoji-id="5240026767325961445">👤</tg-emoji> Ответственный: <b>${escapeHtml(responsible)}</b>`;
+  await renderPhotoPrompt(ctx, WELCOME_IMAGE_PATH, caption, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function renderRentalCard(ctx: Ctx, number: number) {
+  const rental = getRentalByNumber(number);
+  if (!rental) {
+    await replaceOrReply(ctx, "<b>Аккаунт не найден.</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[rentalBackButton()]]).reply_markup,
+    });
+    return;
+  }
+  const busyText = Number(rental.is_busy || 0) ? "\n\n<b>Статус:</b> занят" : "";
+  const renter = getUserById(Number(rental.rented_by_user_id || 0));
+  const renterText = `\n<b>Арендован:</b> ${escapeHtml(userLabel(renter))}`;
+  await replaceOrReply(
+    ctx,
+    `<b>${escapeHtml(String(rental.title || `Аккаунт #${rental.number}`))} №${rental.number}</b>\n\n${escapeHtml(String(rental.description || "Описание не указано."))}${canManageRentals(ensureUser(ctx)) ? renterText : ""}${busyText}`,
+    {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback("🧾 Арендовать", `rent:take:${rental.number}`)],
+        [rentalBackButton()],
+      ]).reply_markup,
+    },
+  );
+}
+
+async function renderRentalsManage(ctx: Ctx) {
+  const keyboardRows = [
+    [Markup.button.callback("➕ Добавить аккаунт(ы)", "rent:add")],
+    [Markup.button.callback("🗑 Удалить аккаунт(ы)", "rent:delete")],
+    [Markup.button.callback("✏️ Редактировать", "rent:edit")],
+    [Markup.button.callback("⛔ Отменить аренду", "rent:cancel")],
+  ];
+  const me = ensureUser(ctx);
+  if (hasRole(me, ["ADMIN"])) {
+    keyboardRows.push([Markup.button.callback("👤 Ответственный", "rent:responsible")]);
+  }
+  keyboardRows.push([rentalBackButton()]);
+  await replaceOrReply(ctx, "<b>⚙️ Управление арендой</b>", {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function renderRentalsCancelMenu(ctx: Ctx) {
+  const rows = activeRentalRows();
+  const keyboardRows = rows.map((row) => [
+    Markup.button.callback(
+      `Отменить: ${String(row.title || `Аккаунт #${row.number}`)} №${row.number}`,
+      `rent:cancel:${row.number}`,
+    ),
+  ]);
+  keyboardRows.push([Markup.button.callback("⬅️ Назад", "rent:manage")]);
+  await replaceOrReply(ctx, rows.length ? "<b>⛔ Выберите активную аренду</b>" : "<b>Активных аренд нет.</b>", {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function renderRentalsDeleteMenu(ctx: Ctx) {
+  const rows = rentalRows();
+  const keyboardRows = rows.map((row) => [
+    Markup.button.callback(`Удалить: ${String(row.title || `Аккаунт #${row.number}`)}`, `rent:delete:${row.number}`),
+  ]);
+  if (rows.length) keyboardRows.unshift([Markup.button.callback("🧹 Удалить все аккаунты", "rent:delete_all")]);
+  keyboardRows.push([Markup.button.callback("⬅️ Назад", "rent:manage")]);
+  await replaceOrReply(ctx, rows.length ? "<b>🗑 Удаление аккаунтов</b>" : "<b>Удалять нечего.</b>", {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function renderRentalsEditList(ctx: Ctx) {
+  const rows = rentalRows();
+  const keyboardRows = rows.map((row) => [
+    Markup.button.callback(rentalListLabel(row), `rent:edit:${row.number}`),
+  ]);
+  keyboardRows.push([Markup.button.callback("⬅️ Назад", "rent:manage")]);
+  await replaceOrReply(ctx, rows.length ? "<b>✏️ Выберите объявление</b>" : "<b>Редактировать нечего.</b>", {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function renderRentalEditFields(ctx: Ctx, number: number) {
+  const rental = getRentalByNumber(number);
+  if (!rental) {
+    await renderRentalsEditList(ctx);
+    return;
+  }
+  await replaceOrReply(ctx, `<b>✏️ ${escapeHtml(String(rental.title || `Аккаунт #${number}`))}</b>\n\nЧто изменить?`, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("Название", `rent:edit:${number}:title`)],
+      [Markup.button.callback("Описание", `rent:edit:${number}:description`)],
+      [Markup.button.callback("⬅️ Назад", "rent:edit")],
+    ]).reply_markup,
+  });
+}
+
+function removeRentalByNumber(number: number) {
+  const stateData = appState();
+  const before = stateData.rentals.length;
+  const removed = stateData.rentals.find((row: any) => Number(row.number) === Number(number));
+  stateData.rentals = stateData.rentals.filter((row: any) => Number(row.number) !== Number(number));
+  if (removed) {
+    stateData.guard_attempts = (stateData.guard_attempts as any[]).filter((row) => Number(row.rental_id) !== Number(removed.id));
+    stateData.rent_request_messages = (stateData.rent_request_messages as any[]).filter((row) => Number(row.rental_id) !== Number(removed.id));
+  }
+  if (before !== stateData.rentals.length) saveState();
+  return before - stateData.rentals.length;
+}
+
+function removeAllRentals() {
+  const stateData = appState();
+  const count = stateData.rentals.length;
+  stateData.rentals = [];
+  stateData.guard_attempts = [];
+  stateData.rent_request_messages = [];
+  if (count) saveState();
+  return count;
+}
+
+function parseLoginPassword(raw: string) {
+  const match = String(raw || "").trim().match(/^([^:\s]+)\s*:\s*(.+)$/);
+  if (!match) return null;
+  return { login: match[1].trim(), password: match[2].trim() };
+}
+
+function addRentalAccount(ownerUserId: number, title: string, description: string, mafilePath: string, login: string, password: string) {
+  const rows = appState().rentals as any[];
+  const row = {
+    id: rows.reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1,
+    number: nextRentalNumber(),
+    owner_user_id: Number(ownerUserId),
+    title,
+    login,
+    pass: password,
+    guard_code: null,
+    steam_id: null,
+    steam_refresh_token: null,
+    steam_login_secure: null,
+    steam_login_secure_exp: null,
+    steam_session_id: null,
+    steam_browser_id: null,
+    mafile_path: mafilePath,
+    mafile_archive_path: mafilePath,
+    description,
+    is_busy: 0,
+    rented_by_user_id: null,
+  };
+  rows.push(row);
+  saveState();
+  return row;
+}
+
+async function saveTelegramDocument(ctx: Ctx, document: any) {
+  const fileName = String(document.file_name || `mafile_${Date.now()}.maFile`).replace(/[^\w.\-() ]+/g, "_");
+  const link = await ctx.telegram.getFileLink(document.file_id);
+  const response = await fetch(link.toString());
+  if (!response.ok) return null;
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const dir = path.join(process.cwd(), "data", "rentals");
+  await fs.mkdir(dir, { recursive: true });
+  const filePath = path.join(dir, `${Date.now()}_${fileName}`);
+  await fs.writeFile(filePath, buffer);
+  return { filePath, buffer };
+}
+
+function managersForRentals() {
+  const roleRows = appState().user_roles as any[];
+  const userIds = new Set(
+    roleRows
+      .filter((row) => row.role === "HELPER" || row.role === "ADMIN")
+      .map((row) => Number(row.user_id)),
+  );
+  for (const user of appState().users as any[]) {
+    if (ADMIN_IDS.includes(Number(user.tg_id || 0))) userIds.add(Number(user.id));
+  }
+  return [...userIds]
+    .map((id) => getUserById(id))
+    .filter((user) => user && Number(user.is_banned || 0) !== 1 && Number(user.tg_id || 0));
+}
+
+async function notifyRentalManagers(ctx: Ctx, rental: any, requester: any, discordUser?: any) {
+  const managers = managersForRentals();
+  const discordLine = discordUser
+    ? `\nDiscord: <b>${escapeHtml(String(discordUser.discord_display_name || discordUser.discord_username || "-"))}</b> <code>${escapeHtml(String(discordUser.discord_user_id || "-"))}</code>`
+    : "";
+  const text =
+    `<b>Заявка на аренду</b>\n\n` +
+    `Пользователь: <b>${escapeHtml(userLabel(requester))}</b>\n` +
+    `TG ID: <code>${escapeHtml(String(requester.tg_id || "-"))}</code>\n` +
+    `${discordLine}\n` +
+    `Аккаунт: <b>${escapeHtml(String(rental.title || `Аккаунт #${rental.number}`))} №${rental.number}</b>`;
+  for (const manager of managers) {
+    const sent = await ctx.telegram.sendMessage(Number(manager.tg_id), text, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Одобрить", `rent:req:approve:${rental.number}:${requester.id}`),
+          Markup.button.callback("❌ Отклонить", `rent:req:decline:${rental.number}:${requester.id}`),
+        ],
+      ]).reply_markup,
+    }).catch(() => null);
+    if (sent?.message_id) {
+      db.prepare("INSERT INTO RENT_REQUEST_MESSAGES (RENTAL_ID, USER_ID, ADMIN_TG_ID, MESSAGE_ID) VALUES (?, ?, ?, ?)").run(
+        rental.id,
+        requester.id,
+        manager.tg_id,
+        sent.message_id,
+      );
+    }
+  }
+  return managers.length;
+}
+
+async function sendRentalReportReminder(rental: any) {
+  const renter = getUserById(Number(rental.rented_by_user_id || 0));
+  if (!renter?.tg_id) return false;
+  const reports = rentReports();
+  const report = {
+    id: nextRowId(reports),
+    rental_id: Number(rental.id),
+    rental_number: Number(rental.number),
+    user_id: Number(renter.id),
+    status: "REQUESTED",
+    requested_at: nowIso(),
+    deadline_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    submitted_at: null,
+    reviewed_at: null,
+    reviewed_by_user_id: null,
+    file_id: null,
+    file_unique_id: null,
+    admin_comment: null,
+  };
+  reports.push(report);
+  rental.report_deadline_at = report.deadline_at;
+  rental.last_report_date = moscowNowParts().dateKey;
+  saveState();
+
+  const text =
+    `<b>Пора предоставить отчет по аренде аккаунта №${rental.number}.</b>\n\n` +
+    `Нажмите кнопку ниже и отправьте скрин списка игр.\n\n` +
+    `<b>Срок: 24 часа с момента этого сообщения.</b>\n` +
+    `Если отчет не будет отправлен 2 раза за 7 дней, аренда отменится автоматически.`;
+  const sent = await bot.telegram.sendMessage(Number(renter.tg_id), text, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([[Markup.button.callback("📸 Отправить отчет", `rent:report:upload:${report.id}`)]]).reply_markup,
+  }).catch(() => null);
+  if (sent?.message_id) {
+    rental.last_report_message_id = sent.message_id;
+    saveState();
+  }
+  return true;
+}
+
+async function notifyRentalReportManagers(ctx: Ctx, report: any) {
+  const rental = getRentalById(Number(report.rental_id));
+  const renter = getUserById(Number(report.user_id));
+  if (!rental || !renter) return 0;
+  const text =
+    `<b>Отчет по аренде</b>\n\n` +
+    `Аккаунт: <b>№${rental.number}</b>\n` +
+    `Пользователь: <b>${escapeHtml(userLabel(renter))}</b>\n` +
+    `TG ID: <code>${escapeHtml(String(renter.tg_id || "-"))}</code>`;
+  let sentCount = 0;
+  for (const manager of managersForRentals()) {
+    const sent = await ctx.telegram.sendPhoto(Number(manager.tg_id), String(report.file_id), {
+      caption: text,
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Одобрить", `rent:report:approve:${report.id}`),
+          Markup.button.callback("❌ Отклонить", `rent:report:reject:${report.id}`),
+        ],
+      ]).reply_markup,
+    }).catch(() => null);
+    if (sent) sentCount += 1;
+  }
+  return sentCount;
+}
+
+async function runRentReportTick() {
+  const moscow = moscowNowParts();
+  for (const rental of activeRentalRows()) {
+    const deadline = String(rental.report_deadline_at || "");
+    if (deadline && Date.parse(deadline) <= Date.now()) {
+      const renter = getUserById(Number(rental.rented_by_user_id || 0));
+      const misses = markRentalReportMiss(rental);
+      rental.report_deadline_at = null;
+      saveState();
+      if (misses >= 2) {
+        cancelRental(rental);
+        if (renter?.tg_id) {
+          await bot.telegram.sendMessage(
+            Number(renter.tg_id),
+            `<b>Аренда аккаунта №${rental.number} отменена автоматически.</b>\nОтчет не был предоставлен 2 раза за последние 7 дней.`,
+            { parse_mode: "HTML" },
+          ).catch(() => null);
+        }
+      } else if (renter?.tg_id) {
+        await bot.telegram.sendMessage(
+          Number(renter.tg_id),
+          `<b>Отчет по аренде аккаунта №${rental.number} не был отправлен вовремя.</b>\nЭто первое нарушение за последние 7 дней. При втором пропуске аренда будет отменена автоматически.`,
+          { parse_mode: "HTML" },
+        ).catch(() => null);
+      }
+      continue;
+    }
+    if (moscow.hour === 20 && moscow.minute === 0 && String(rental.last_report_date || "") !== moscow.dateKey) {
+      await sendRentalReportReminder(rental);
+    }
+  }
+}
+
+function startRentReportLoop() {
+  if (rentReportLoopStarted) return;
+  rentReportLoopStarted = true;
+  setInterval(() => {
+    runRentReportTick().catch((error) => console.error("[RENT REPORT LOOP ERROR]", error));
+  }, 60_000);
+  runRentReportTick().catch(() => null);
+}
+
+async function runRentDiscordBridgeTick(ctxLike?: Ctx) {
+  if (typeof store.reloadNow === "function") {
+    store.reloadNow();
+  }
+  const rows = rentDiscordPendingRows().filter((row) => String(row.status || "") === "CONFIRMED" && !row.processed_at);
+  for (const row of rows) {
+    const rental = getRentalByNumber(Number(row.rental_number || 0));
+    const requester = getUserById(Number(row.tg_user_id || 0));
+    if (!rental || !requester) {
+      row.status = "FAILED";
+      row.processed_at = nowIso();
+      row.updated_at = nowIso();
+      saveState();
+      continue;
+    }
+    if (Number(rental.is_busy || 0) === 1 && Number(rental.rented_by_user_id || 0) !== Number(requester.id)) {
+      row.status = "FAILED";
+      row.processed_at = nowIso();
+      row.updated_at = nowIso();
+      saveState();
+      if (requester.tg_id) {
+        await bot.telegram.sendMessage(Number(requester.tg_id), "<b>Аккаунт уже занят. Выберите другой аккаунт.</b>", {
+          parse_mode: "HTML",
+        }).catch(() => null);
+      }
+      continue;
+    }
+    const bridgeCtx = ctxLike || ({ telegram: bot.telegram } as any);
+    const notified = await notifyRentalManagers(bridgeCtx, rental, requester, row);
+    row.status = "SENT";
+    row.processed_at = nowIso();
+    row.updated_at = nowIso();
+    saveState();
+    if (requester.tg_id) {
+      await bot.telegram.sendMessage(
+        Number(requester.tg_id),
+        `<b>Discord подтвержден.</b>\nЗаявка по аккаунту №${rental.number} отправлена администраторам и помощникам.`,
+        { parse_mode: "HTML" },
+      ).catch(() => null);
+    }
+    logEvent(requester, "rentals", `discord_confirmed:${rental.number}:managers:${notified}`);
+  }
+}
+
+function startRentDiscordBridgeLoop() {
+  if (rentDiscordBridgeLoopStarted) return;
+  rentDiscordBridgeLoopStarted = true;
+  setInterval(() => {
+    runRentDiscordBridgeTick().catch((error) => console.error("[RENT DISCORD BRIDGE ERROR]", error));
+  }, 5_000);
+  runRentDiscordBridgeTick().catch(() => null);
+}
+
+function guardAttemptFor(rentalId: number, userId: number) {
+  return (appState().guard_attempts as any[]).find(
+    (row) => Number(row.rental_id) === Number(rentalId) && Number(row.user_id) === Number(userId),
+  ) || null;
+}
+
+function steamGuardCodeFromSharedSecret(sharedSecret: string, timestampSeconds = Math.floor(Date.now() / 1000)) {
+  const alphabet = "23456789BCDFGHJKMNPQRTVWXY";
+  const secret = Buffer.from(sharedSecret, "base64");
+  const timeBuffer = Buffer.alloc(8);
+  timeBuffer.writeUInt32BE(Math.floor(timestampSeconds / 30), 4);
+  const hmac = crypto.createHmac("sha1", secret).update(timeBuffer).digest();
+  const start = hmac[19] & 0x0f;
+  let codePoint = hmac.readUInt32BE(start) & 0x7fffffff;
+  let code = "";
+  for (let index = 0; index < 5; index += 1) {
+    code += alphabet[codePoint % alphabet.length];
+    codePoint = Math.floor(codePoint / alphabet.length);
+  }
+  return code;
+}
+
+async function generateSteamGuardCodeFromRental(rental: any) {
+  const mafilePath = String(rental.mafile_path || rental.mafile_archive_path || "").trim();
+  if (!mafilePath) return null;
+  try {
+    const raw = await fs.readFile(mafilePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const sharedSecret = String(parsed.shared_secret || parsed.SharedSecret || "").trim();
+    if (!sharedSecret) return null;
+    return steamGuardCodeFromSharedSecret(sharedSecret);
+  } catch {
+    return null;
+  }
+}
+
+function ensureGuardAttempt(rentalId: number, userId: number, attemptsLeft: number) {
+  const rows = appState().guard_attempts as any[];
+  const row = guardAttemptFor(rentalId, userId);
+  if (row) {
+    row.attempts_left = attemptsLeft;
+  } else {
+    rows.push({
+      id: rows.reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1,
+      rental_id: Number(rentalId),
+      user_id: Number(userId),
+      attempts_left: attemptsLeft,
+    });
+  }
+  saveState();
+}
+
+async function clearRentalRequestMessages(ctx: Ctx, rental: any, requester: any) {
+  const rows = db.prepare("SELECT ADMIN_TG_ID, MESSAGE_ID FROM RENT_REQUEST_MESSAGES WHERE RENTAL_ID = ? AND USER_ID = ?").all(rental.id, requester.id) as any[];
+  for (const row of rows) {
+    await ctx.telegram.deleteMessage(Number(row.admin_tg_id), Number(row.message_id)).catch(() => null);
+  }
+  db.prepare("DELETE FROM RENT_REQUEST_MESSAGES WHERE RENTAL_ID = ? AND USER_ID = ?").run(rental.id, requester.id);
+}
+
+async function renderOnlineWatchList(ctx: Ctx, user: any) {
+  const rows = getOnlineWatchRowsForUser(user.id);
+  const text = rows.length
+    ? `<b>Аккаунты на чекере:</b>\n\n${rows
+        .map((row, index) => {
+          const comment = String(row.comment || "").trim();
+          return `${index + 1}. <a href="${escapeHtml(String(row.profile_url))}">Профиль</a>${comment ? ` — <b>${escapeHtml(comment)}</b>` : ""}`;
+        })
+        .join("\n")}`
+    : "<b>Список чекера пуст.</b>";
+
+  const keyboardRows = rows.length
+    ? [
+        [Markup.button.callback("🧹 Очистить все", "online_watch:clear")],
+        [Markup.button.callback("⬅️ Назад", "online_watch:menu")],
+      ]
+    : [[Markup.button.callback("⬅️ Назад", "online_watch:menu")]];
+
+  await replaceOrReply(ctx, text, {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
+  });
+}
+
+async function clearOnlineWatchRowsForUser(ctx: Ctx, user: any) {
+  const stateData = appState();
+  const rows = getOnlineWatchRowsForUser(user.id);
+  const ids = new Set(rows.map((row) => Number(row.id)));
+  stateData.online_watch = (stateData.online_watch as any[]).filter((row) => !ids.has(Number(row.id)));
+  for (const id of ids) {
+    syncStateForRemovedWatch(id);
+  }
+  saveState();
+  await replaceOrReply(ctx, `<b>Чекер очищен.</b>\nУдалено аккаунтов: <b>${ids.size}</b>`, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "online_watch:menu")]]).reply_markup,
+  });
 }
 
 async function handleOnlineWatchProfile(ctx: Ctx, me: any, text: string) {
@@ -1083,12 +2072,14 @@ async function handleOnlineWatchComment(ctx: Ctx, me: any, flow: Extract<UserFlo
   const comment = text.trim() === "-" ? null : text.trim();
   db.prepare("INSERT INTO online_watch (user_id, profile_url, comment) VALUES (?, ?, ?)").run(me.id, profileUrl, comment);
   state.delete(ctx.from.id);
+  uiPromptMsg.delete(ctx.from.id);
   startOnlineWatchLoop();
-  await sendCleanPrompt(
-    ctx,
-    `<tg-emoji emoji-id="5240187442052510372">🔔</tg-emoji> <b>Отслеживание профиля успешно включено.</b>\n\nКак только профиль появится онлайн, бот отправит уведомление.`,
-    { parse_mode: "HTML" },
-  );
+  await ctx
+    .reply(
+      `<b>Отслеживание профиля успешно включено.</b>\n\nКак только профиль появится онлайн, бот отправит уведомление.`,
+      { parse_mode: "HTML" },
+    )
+    .catch(() => null);
 }
 
 async function syncBotCommands() {
@@ -1227,135 +2218,6 @@ async function closeSteamRenderer() {
   steamReadyPromise = null;
 }
 
-async function fetchSteamProfileData(profileUrl: string): Promise<SteamProfileData | null> {
-  const cached = steamProfileCache.get(profileUrl);
-  if (cached && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
-    return { ...cached };
-  }
-  const normalizedRaw = profileUrl.replace(/\/+$/, "");
-  const canonicalMatch = normalizedRaw.match(/(https?:\/\/[^/]+\/(?:profiles\/7\d{15,18}|id\/[A-Za-z0-9_-]{2,64}))\/?/i);
-  const normalized = canonicalMatch ? canonicalMatch[1] : normalizedRaw;
-
-  try {
-    await ensureSteamRendererReady();
-    await steamSourcePage.goto(normalized, { waitUntil: "domcontentloaded", timeout: 7000 });
-    await steamSourcePage.waitForTimeout(90);
-    const parsed = (await steamSourcePage.evaluate(() => {
-      const name = (document.querySelector(".actual_persona_name") as HTMLElement | null)?.innerText?.trim() || "";
-      const levelNode = document.querySelector(".friendPlayerLevelNum") as HTMLElement | null;
-      const level = levelNode?.innerText?.trim() || null;
-      const levelWrap = document.querySelector(".friendPlayerLevel") as HTMLElement | null;
-      const levelClass = levelWrap?.className.match(/\blvl_\d+\b/)?.[0] || null;
-      const avatarCandidates = Array.from(
-        document.querySelectorAll(".playerAvatarAutoSizeInner img, .playerAvatar img"),
-      ) as HTMLImageElement[];
-      const nonFrame = avatarCandidates.filter((img) => !img.closest(".profile_avatar_frame"));
-      const pick = (items: HTMLImageElement[]) =>
-        items.find((img) => {
-          const srcset = String(img.getAttribute("srcset") || "");
-          const src = String(img.getAttribute("src") || img.src || "");
-          const all = `${srcset} ${src}`.toLowerCase();
-          return /_full\.(jpg|png|webp)/.test(all) || /avatars\./.test(all);
-        }) || items[0] || null;
-      const avatar = pick(nonFrame) || pick(avatarCandidates);
-      const rawSet = String(avatar?.getAttribute("srcset") || "").split(",")[0]?.trim() || "";
-      const avatarFull = rawSet.split(" ")[0] || avatar?.getAttribute("src") || avatar?.src || null;
-      const frameNode =
-        (document.querySelector(".profile_avatar_frame img") as HTMLImageElement | null) ||
-        (document.querySelector(".profile_avatar_frame source[srcset]") as HTMLSourceElement | null);
-      const frameRaw = String(frameNode?.getAttribute("srcset") || frameNode?.getAttribute("src") || "").split(",")[0]?.trim() || "";
-      return {
-        name,
-        avatarFull,
-        avatarFrame: frameRaw.split(" ")[0] || null,
-        level,
-        levelClass,
-        profilePageHtml: (document.querySelector(".profile_page") as HTMLElement | null)?.outerHTML || null,
-        bodyClass: document.body?.className || null,
-        headerContentHtml: (document.querySelector(".profile_header_content") as HTMLElement | null)?.outerHTML || null,
-        badgeHtml: (document.querySelector(".profile_header_badge") as HTMLElement | null)?.outerHTML || null,
-        rightColHtml: (document.querySelector(".profile_rightcol") as HTMLElement | null)?.outerHTML || null,
-      };
-    })) as any;
-
-    if (parsed?.name && !/^sign\s*in$/i.test(String(parsed.name).trim())) {
-      const toAbs = (url: string | null) => {
-        if (!url) return null;
-        try {
-          return new URL(url, `${normalized}/`).toString();
-        } catch {
-          return url;
-        }
-      };
-      const avatarFull = toAbs(parsed.avatarFull || null);
-      const avatarFrame = toAbs(parsed.avatarFrame || null);
-      const result: SteamProfileData = {
-        name: parsed.name,
-        avatarFull,
-        avatarMedium: avatarFull ? avatarFull.replace(/_full\.jpg$/i, "_medium.jpg") : null,
-        avatarIcon: avatarFull ? avatarFull.replace(/_full\.jpg$/i, ".jpg") : null,
-        avatarFrame,
-        level: parsed.level || null,
-        levelClass: parsed.levelClass || null,
-        profilePageHtml: parsed.profilePageHtml || null,
-        bodyClass: parsed.bodyClass || null,
-        headerContentHtml: parsed.headerContentHtml || null,
-        badgeHtml: parsed.badgeHtml || null,
-        rightColHtml: parsed.rightColHtml || null,
-      };
-      steamProfileCache.set(profileUrl, { ...result, updatedAt: Date.now() });
-      return result;
-    }
-  } catch {}
-
-  const xml = await fetchTextSafe(`${normalized}/?xml=1`);
-  if (xml) {
-    const rawName = String(xml.match(/<steamID><!\[CDATA\[(.*?)\]\]><\/steamID>/i)?.[1] || "").trim();
-    const avatarFull = String(xml.match(/<avatarFull><!\[CDATA\[(.*?)\]\]><\/avatarFull>/i)?.[1] || "").trim() || null;
-    const avatarMedium = String(xml.match(/<avatarMedium><!\[CDATA\[(.*?)\]\]><\/avatarMedium>/i)?.[1] || "").trim() || null;
-    const avatarIcon = String(xml.match(/<avatarIcon><!\[CDATA\[(.*?)\]\]><\/avatarIcon>/i)?.[1] || "").trim() || null;
-    if (rawName && !/^sign\s*in$/i.test(rawName)) {
-      const result: SteamProfileData = {
-        name: rawName,
-        avatarFull,
-        avatarMedium,
-        avatarIcon,
-        avatarFrame: null,
-        level: null,
-        levelClass: null,
-        profilePageHtml: null,
-        bodyClass: null,
-        headerContentHtml: null,
-        badgeHtml: null,
-        rightColHtml: null,
-      };
-      steamProfileCache.set(profileUrl, { ...result, updatedAt: Date.now() });
-      return result;
-    }
-  }
-
-  const oembed = await fetchJsonSafe(`https://steamcommunity.com/oembed?url=${encodeURIComponent(profileUrl)}`);
-  const rawName = String(oembed?.author_name || oembed?.title || "").trim().replace(/^Steam Community ::\s*/i, "");
-  if (!rawName || /^sign\s*in$/i.test(rawName)) return null;
-
-  const result: SteamProfileData = {
-    name: rawName,
-    avatarFull: STEAM_FRIEND_FALLBACK_AVATAR_URL,
-    avatarMedium: STEAM_FRIEND_FALLBACK_AVATAR_URL.replace(/_full\.jpg$/i, "_medium.jpg"),
-    avatarIcon: STEAM_FRIEND_FALLBACK_AVATAR_URL.replace(/_full\.jpg$/i, ".jpg"),
-    avatarFrame: null,
-    level: null,
-    levelClass: null,
-    profilePageHtml: null,
-    bodyClass: null,
-    headerContentHtml: null,
-    badgeHtml: null,
-    rightColHtml: null,
-  };
-  steamProfileCache.set(profileUrl, { ...result, updatedAt: Date.now() });
-  return result;
-}
-
 async function loadInvitePageData(inviteUrl: string): Promise<InvitePageData> {
   const cached = invitePageCache.get(inviteUrl);
   if (cached && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
@@ -1381,10 +2243,14 @@ async function loadInvitePageData(inviteUrl: string): Promise<InvitePageData> {
         (document.querySelector(".persona_name .actual_persona_name") as HTMLElement | null)?.innerText?.trim() ||
         "";
       const avatarWrap = (document.querySelector(".playerAvatarAutoSizeInner") as HTMLElement | null) || null;
-      const avatarSrc =
-        (avatarWrap?.querySelector("img[srcset*='_full']") as HTMLImageElement | null)?.getAttribute("srcset") ||
-        (avatarWrap?.querySelector("img[src*='_full']") as HTMLImageElement | null)?.getAttribute("src") ||
+      const avatarImg =
+        (avatarWrap?.querySelector("img[srcset*='_full']") as HTMLImageElement | null) ||
+        (avatarWrap?.querySelector("img[src*='_full']") as HTMLImageElement | null) ||
+        (avatarWrap?.querySelector("img[srcset*='avatar.']") as HTMLImageElement | null) ||
+        (avatarWrap?.querySelector("img[src*='avatar.']") as HTMLImageElement | null) ||
+        (avatarWrap?.querySelector("img") as HTMLImageElement | null) ||
         null;
+      const avatarSrc = avatarImg?.getAttribute("srcset") || avatarImg?.getAttribute("src") || null;
       const frameSrc =
         (avatarWrap?.querySelector(".profile_avatar_frame img") as HTMLImageElement | null)?.getAttribute("src") ||
         (avatarWrap?.querySelector(".profile_avatar_frame source") as HTMLSourceElement | null)?.getAttribute("srcset") ||
@@ -1478,18 +2344,6 @@ async function sizeSteamTemplatePageFromBackground(page: any, fallback: { w: num
   }, fallback);
   await page.setViewportSize({ width: dims.w, height: dims.h });
   return dims;
-}
-
-async function waitForSteamTemplateAvatar(page: any) {
-  await page
-    .waitForFunction(
-      () => {
-        const img = document.querySelector(".avatar") as HTMLImageElement | null;
-        return Boolean(!img || (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0));
-      },
-      { timeout: 5000, polling: 100 },
-    )
-    .catch(() => null);
 }
 
 async function makeSteamProfileScreenshot(
@@ -2202,169 +3056,6 @@ async function makeSteamQrPageScreenshot(displayTime: string, inviteLink: string
   return run;
 }
 
-async function makeSteamBanCs2Screenshot(profileUrl: string) {
-  const task = async () => {
-    await ensureSteamRendererReady();
-    const templatePath = path.join(process.cwd(), "src", "templates", "bancs2.png");
-    const fontPath = path.join(process.cwd(), "src", "templates", "stratumno2_regular.otf");
-    const templateUrl = `file:///${templatePath.replace(/\\/g, "/")}`;
-    const fontUrl = `file:///${fontPath.replace(/\\/g, "/")}`;
-    const profile = await fetchSteamProfileData(profileUrl);
-    const avatarFull = profile?.avatarFull || STEAM_FRIEND_FALLBACK_AVATAR_URL;
-    const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-steam-ban-cs2-"));
-    const tempHtmlPath = path.join(tmpDir, `ban_${Date.now()}.html`);
-    const screenshotPath = path.join(tmpDir, `ban_${Date.now()}.png`);
-    const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    @font-face { font-family: "StratumNo2Regular"; src: url("${fontUrl}") format("opentype"); }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
-    body { position: relative; }
-    .bg { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; object-fit: fill; }
-    .avatar { position: absolute; left: 991px; top: 724px; width: 51px; height: 51px; object-fit: cover; }
-    .name { position: absolute; top: 676px; font-family: "StratumNo2Regular", sans-serif; color: #ebebeb; font-size: 16px; transform: scaleX(0.86); transform-origin: left center; white-space: nowrap; }
-  </style>
-</head>
-<body>
-  <img class="bg" src="${templateUrl}" alt="template" />
-  <img class="avatar" src="${escapeHtml(avatarFull)}" alt="avatar" />
-  ${profile?.name ? `<div id="profile-name" class="name">${escapeHtml(profile.name)}</div>` : ""}
-</body>
-</html>`;
-    await fs.writeFile(tempHtmlPath, html, "utf8");
-    await steamTemplatePage.goto(`file:///${tempHtmlPath.replace(/\\/g, "/")}`, { waitUntil: "domcontentloaded", timeout: 12000 });
-    await steamTemplatePage.evaluate(() => {
-      const name = document.getElementById("profile-name") as HTMLElement | null;
-      if (!name) return;
-      name.style.left = "0px";
-      const measured = Math.ceil(name.getBoundingClientRect().width);
-      const x = 978 + (73 - measured) / 2;
-      name.style.left = `${x}px`;
-    });
-    const dims = await sizeSteamTemplatePageFromBackground(steamTemplatePage, { w: 1280, h: 720 });
-    await waitForSteamTemplateAvatar(steamTemplatePage);
-    await steamTemplatePage.screenshot({ path: screenshotPath, clip: { x: 0, y: 0, width: dims.w, height: dims.h } });
-    return screenshotPath;
-  };
-
-  const run = steamRenderChain.then(task, task);
-  steamRenderChain = run.then(() => undefined, () => undefined);
-  return run;
-}
-
-async function makeSteamCodeCs2Screenshot(profileUrl: string) {
-  const task = async () => {
-    await ensureSteamRendererReady();
-    const templatePath = path.join(process.cwd(), "src", "templates", "codecs2.png");
-    const fontPath = path.join(process.cwd(), "src", "templates", "stratumno2_regular.otf");
-    const templateUrl = `file:///${templatePath.replace(/\\/g, "/")}`;
-    const fontUrl = `file:///${fontPath.replace(/\\/g, "/")}`;
-    const profile = await fetchSteamProfileData(profileUrl);
-    const avatarFull = profile?.avatarFull || STEAM_FRIEND_FALLBACK_AVATAR_URL;
-    const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-steam-code-cs2-"));
-    const tempHtmlPath = path.join(tmpDir, `code_${Date.now()}.html`);
-    const screenshotPath = path.join(tmpDir, `code_${Date.now()}.png`);
-    const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    @font-face { font-family: "StratumNo2Regular"; src: url("${fontUrl}") format("opentype"); }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
-    body { position: relative; }
-    .bg { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; object-fit: fill; }
-    .avatar { position: absolute; left: 974.72px; top: 726.18px; width: 51px; height: 51px; object-fit: cover; filter: brightness(0.62); }
-    .name { position: absolute; top: 676px; font-family: "StratumNo2Regular", sans-serif; color: rgb(176,176,176); font-size: 16px; transform: scaleX(0.86); transform-origin: left center; white-space: nowrap; filter: brightness(0.64); }
-  </style>
-</head>
-<body>
-  <img class="bg" src="${templateUrl}" alt="template" />
-  <img class="avatar" src="${escapeHtml(avatarFull)}" alt="avatar" />
-  ${profile?.name ? `<div id="profile-name" class="name">${escapeHtml(profile.name)}</div>` : ""}
-</body>
-</html>`;
-    await fs.writeFile(tempHtmlPath, html, "utf8");
-    await steamTemplatePage.goto(`file:///${tempHtmlPath.replace(/\\/g, "/")}`, { waitUntil: "domcontentloaded", timeout: 12000 });
-    await steamTemplatePage.evaluate(() => {
-      const name = document.getElementById("profile-name") as HTMLElement | null;
-      if (!name) return;
-      name.style.left = "0px";
-      const measured = Math.ceil(name.getBoundingClientRect().width);
-      const x = 963 + (72 - measured) / 2;
-      name.style.left = `${x}px`;
-    });
-    const dims = await sizeSteamTemplatePageFromBackground(steamTemplatePage, { w: 1280, h: 720 });
-    await waitForSteamTemplateAvatar(steamTemplatePage);
-    await steamTemplatePage.screenshot({ path: screenshotPath, clip: { x: 0, y: 0, width: dims.w, height: dims.h } });
-    return screenshotPath;
-  };
-
-  const run = steamRenderChain.then(task, task);
-  steamRenderChain = run.then(() => undefined, () => undefined);
-  return run;
-}
-
-async function makeSteamCodeCs2NotFoundScreenshot(profileUrl: string, mammothCode: string) {
-  const task = async () => {
-    await ensureSteamRendererReady();
-    const templatePath = path.join(process.cwd(), "src", "templates", "codenotfoundcs2.png");
-    const fontPath = path.join(process.cwd(), "src", "templates", "stratumno2_regular.otf");
-    const templateUrl = `file:///${templatePath.replace(/\\/g, "/")}`;
-    const fontUrl = `file:///${fontPath.replace(/\\/g, "/")}`;
-    const profile = await fetchSteamProfileData(profileUrl);
-    const avatarFull = profile?.avatarFull || STEAM_FRIEND_FALLBACK_AVATAR_URL;
-    const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-steam-code-cs2-nf-"));
-    const tempHtmlPath = path.join(tmpDir, `code_nf_${Date.now()}.html`);
-    const screenshotPath = path.join(tmpDir, `code_nf_${Date.now()}.png`);
-    const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    @font-face { font-family: "StratumNo2Regular"; src: url("${fontUrl}") format("opentype"); }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
-    body { position: relative; }
-    .bg { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; object-fit: fill; }
-    .avatar { position: absolute; left: 972px; top: 726px; width: 51px; height: 51px; object-fit: cover; filter: brightness(0.62); }
-    .name { position: absolute; top: 676px; font-family: "StratumNo2Regular", sans-serif; color: rgb(176,176,176); font-size: 16px; transform: scaleX(0.86); transform-origin: left center; white-space: nowrap; filter: brightness(0.64); }
-    .code-main { position: absolute; left: 739px; top: 490px; height: 34px; display: flex; align-items: center; font-family: "StratumNo2Regular", sans-serif; color: rgb(204,204,204); font-size: 20px; white-space: nowrap; }
-    .code-secondary { position: absolute; left: 734px; top: 553px; font-family: "StratumNo2Regular", sans-serif; color: rgb(199,199,199); font-size: 14px; white-space: nowrap; }
-  </style>
-</head>
-<body>
-  <img class="bg" src="${templateUrl}" alt="template" />
-  <img class="avatar" src="${escapeHtml(avatarFull)}" alt="avatar" />
-  ${profile?.name ? `<div id="profile-name" class="name">${escapeHtml(profile.name)}</div>` : ""}
-  <div class="code-main">${escapeHtml(mammothCode)}</div>
-  <div class="code-secondary">No friend found for code '${escapeHtml(mammothCode)}'</div>
-</body>
-</html>`;
-    await fs.writeFile(tempHtmlPath, html, "utf8");
-    await steamTemplatePage.goto(`file:///${tempHtmlPath.replace(/\\/g, "/")}`, { waitUntil: "domcontentloaded", timeout: 12000 });
-    await steamTemplatePage.evaluate(() => {
-      const name = document.getElementById("profile-name") as HTMLElement | null;
-      if (!name) return;
-      name.style.left = "0px";
-      const measured = Math.ceil(name.getBoundingClientRect().width);
-      const x = 960 + (72 - measured) / 2;
-      name.style.left = `${x}px`;
-    });
-    const dims = await sizeSteamTemplatePageFromBackground(steamTemplatePage, { w: 1280, h: 720 });
-    await waitForSteamTemplateAvatar(steamTemplatePage);
-    await steamTemplatePage.screenshot({ path: screenshotPath, clip: { x: 0, y: 0, width: dims.w, height: dims.h } });
-    return screenshotPath;
-  };
-
-  const run = steamRenderChain.then(task, task);
-  steamRenderChain = run.then(() => undefined, () => undefined);
-  return run;
-}
-
 async function makeDota2FakeCodeScreenshot() {
   const templatePath = path.join(process.cwd(), "src", "templates", "code-dota2-fake.png");
   const tmpDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-dota2-code-fake-"));
@@ -2396,7 +3087,7 @@ async function makeDota2CodeNotFoundScreenshot(mammothCode: string) {
     .code {
       position: absolute;
       left: 802px;
-      top: 244px;
+      top: 255px;
       font-family: "Radiance", sans-serif;
       color: #b9bec9;
       font-size: 18.75px;
@@ -2434,6 +3125,75 @@ bot.catch(async (error, ctx) => {
   await ctx.reply("Что-то сломалось во время обработки запроса. Попробуйте еще раз.").catch(() => null);
 });
 
+bot.on("document", async (ctx) => {
+  const me = ensureUser(ctx);
+  if (!me || Number(me.is_banned || 0) === 1) return;
+
+  const flow = state.get(ctx.from.id);
+  if (flow?.mode !== "rent_add_mafile") return;
+  if (!canManageRentals(me)) {
+    state.delete(ctx.from.id);
+    await ctx.reply("<b>Раздел доступен только помощникам и администраторам.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  const saved = await saveTelegramDocument(ctx, (ctx.message as any).document).catch(() => null);
+  if (!saved) {
+    await ctx.reply("<b>Пришлите MaFile документом.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  const rental = addRentalAccount(
+    me.id,
+    flow.payload.title,
+    flow.payload.description,
+    saved.filePath,
+    flow.payload.login,
+    flow.payload.password,
+  );
+  state.delete(ctx.from.id);
+  logEvent(me, "rentals", `add:${rental.number}`);
+  await ctx.reply(`<b>Аккаунт добавлен.</b>\nНомер: <b>№${rental.number}</b>\nНазвание: <b>${escapeHtml(rental.title)}</b>`, {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([[Markup.button.callback("Открыть", `rent:view:${rental.number}`)]]).reply_markup,
+  }).catch(() => null);
+});
+
+bot.on("photo", async (ctx) => {
+  const me = ensureUser(ctx);
+  if (!me || Number(me.is_banned || 0) === 1) return;
+
+  const flow = state.get(ctx.from.id);
+  if (flow?.mode !== "rent_report_upload") return;
+
+  const report = getRentReportById(flow.payload.reportId);
+  const rental = report ? getRentalById(Number(report.rental_id)) : null;
+  if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+    state.delete(ctx.from.id);
+    await ctx.reply("<b>Активный запрос отчета не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  const photos = (ctx.message as any).photo as any[];
+  const photo = photos?.[photos.length - 1];
+  if (!photo?.file_id) {
+    await ctx.reply("<b>Пришлите скрин изображением.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  report.status = "SUBMITTED";
+  report.submitted_at = nowIso();
+  report.file_id = photo.file_id;
+  report.file_unique_id = photo.file_unique_id || null;
+  rental.report_deadline_at = null;
+  saveState();
+  state.delete(ctx.from.id);
+
+  const sent = await notifyRentalReportManagers(ctx, report);
+  await ctx.reply(`<b>Отчет отправлен на проверку.</b>\nПроверяющих уведомлено: <b>${sent}</b>`, { parse_mode: "HTML" }).catch(() => null);
+  logEvent(me, "rent_report", `submit:${report.id}:rental:${rental.number}:managers:${sent}`);
+});
+
 bot.on("text", async (ctx) => {
   const me = ensureUser(ctx);
   if (!me || Number(me.is_banned || 0) === 1) return;
@@ -2445,6 +3205,7 @@ bot.on("text", async (ctx) => {
   const isSettingsBtn = plain.startsWith("Настройки");
   const isDrawBtn = plain.startsWith("Отрисовка");
   const isOnlineBtn = plain.startsWith("Чекер онлайна");
+  const isRentalsBtn = plain.startsWith("Аренда аккаунтов");
 
   if (/^\/start(?:@[\w_]+)?$/i.test(trimmed)) {
     await clearUserFlowOnly(ctx);
@@ -2468,11 +3229,229 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  if (isDrawBtn || isOnlineBtn || isSettingsBtn) {
+  const guardMatch = trimmed.match(/^\/guard(?:@[\w_]+)?\s+(\d+)$/i);
+  if (guardMatch) {
+    const rental = getRentalByNumber(Number(guardMatch[1]));
+    if (!rental || Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+      await ctx.reply("<b>Этот аккаунт не арендован вами.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const attempt = guardAttemptFor(Number(rental.id), Number(me.id));
+    if (!attempt || Number(attempt.attempts_left || 0) <= 0) {
+      await ctx.reply("<b>Код уже был получен. Запросите новый код у помощника или администратора.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const guardCode = await generateSteamGuardCodeFromRental(rental);
+    if (!guardCode) {
+      await ctx.reply("<b>Не удалось получить Guard код из MaFile.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    attempt.attempts_left = 0;
+    saveState();
+    await ctx.reply(`<b>Guard код для входа:</b> <code>${escapeHtml(guardCode)}</code>`, { parse_mode: "HTML" }).catch(() => null);
+    logEvent(me, "rentals", `guard:${rental.number}`);
+    return;
+  }
+
+  const guardSetMatch = trimmed.match(/^\/guardset(?:@[\w_]+)?\s+(\d+)$/i);
+  if (guardSetMatch) {
+    if (!canManageRentals(me)) {
+      await ctx.reply("<b>Нет доступа.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const rental = getRentalByNumber(Number(guardSetMatch[1]));
+    if (!rental || !Number(rental.rented_by_user_id || 0)) {
+      await ctx.reply("<b>Аккаунт не найден или не находится в аренде.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    ensureGuardAttempt(Number(rental.id), Number(rental.rented_by_user_id), 1);
+    await ctx.reply(`<b>Guard доступ выдан.</b>\nАккаунт: <b>№${rental.number}</b>`, { parse_mode: "HTML" }).catch(() => null);
+    const renter = getUserById(Number(rental.rented_by_user_id));
+    if (renter?.tg_id) {
+      await ctx.telegram.sendMessage(
+        Number(renter.tg_id),
+        `<b>Доступен новый код для входа.</b>\nПолучить код: <code>/guard ${rental.number}</code>`,
+        { parse_mode: "HTML" },
+      ).catch(() => null);
+    }
+    logEvent(me, "rentals", `guardset:${rental.number}`);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_add_title") {
+    if (!canManageRentals(me)) {
+      state.delete(ctx.from.id);
+      await showMainMenu(ctx, me, "Раздел доступен только помощникам и администраторам.");
+      return;
+    }
+    const title = trimmed.slice(0, 80);
+    if (!title) {
+      await ctx.reply("<b>Введите название аккаунта.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, { mode: "rent_add_description", payload: { title } });
+    await ctx.reply("<b>Введите описание аккаунта.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_add_description") {
+    if (!canManageRentals(me)) {
+      state.delete(ctx.from.id);
+      await showMainMenu(ctx, me, "Раздел доступен только помощникам и администраторам.");
+      return;
+    }
+    const description = trimmed.slice(0, 2000);
+    state.set(ctx.from.id, { mode: "rent_add_credentials", payload: { title: activeFlow.payload.title, description } });
+    await ctx.reply("<b>Введите данные аккаунта в формате:</b>\n<code>login:pass</code>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_add_credentials") {
+    if (!canManageRentals(me)) {
+      state.delete(ctx.from.id);
+      await showMainMenu(ctx, me, "Раздел доступен только помощникам и администраторам.");
+      return;
+    }
+    const credentials = parseLoginPassword(trimmed);
+    if (!credentials) {
+      await ctx.reply("<b>Нужен формат:</b> <code>login:pass</code>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, {
+      mode: "rent_add_mafile",
+      payload: {
+        title: activeFlow.payload.title,
+        description: activeFlow.payload.description,
+        login: credentials.login,
+        password: credentials.password,
+      },
+    });
+    await ctx.reply("<b>Теперь пришлите MaFile документом.</b>", { parse_mode: "HTML" }).catch(() => null);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_edit_input") {
+    if (!canManageRentals(me)) {
+      state.delete(ctx.from.id);
+      await showMainMenu(ctx, me, "Раздел доступен только помощникам и администраторам.");
+      return;
+    }
+    const rental = getRentalByNumber(activeFlow.payload.number);
+    if (!rental) {
+      state.delete(ctx.from.id);
+      await ctx.reply("<b>Объявление не найдено.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    if (activeFlow.payload.field === "title") {
+      rental.title = trimmed.slice(0, 80);
+    } else {
+      rental.description = trimmed.slice(0, 2000);
+    }
+    saveState();
+    state.delete(ctx.from.id);
+    logEvent(me, "rentals", `edit:${rental.number}:${activeFlow.payload.field}`);
+    await ctx.reply("<b>Объявление обновлено.</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("Открыть", `rent:view:${rental.number}`)]]).reply_markup,
+    }).catch(() => null);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_set_responsible") {
+    if (!hasRole(me, ["ADMIN"])) {
+      state.delete(ctx.from.id);
+      await ctx.reply("<b>Нет доступа.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const username = setRentResponsibleUsername(trimmed);
+    state.delete(ctx.from.id);
+    await ctx.reply(`<b>Ответственный обновлен:</b> <b>${escapeHtml(username || "не назначен")}</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "rent:manage")]]).reply_markup,
+    }).catch(() => null);
+    logEvent(me, "rentals", `responsible:${username || "-"}`);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_discord_handoff") {
+    const rental = getRentalByNumber(activeFlow.payload.rentalNumber);
+    if (!rental) {
+      state.delete(ctx.from.id);
+      await ctx.reply("<b>Аккаунт не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    await ctx.reply(formatDiscordRentalInstruction(rental), {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", `rent:view:${rental.number}`)]]).reply_markup,
+    }).catch(() => null);
+    return;
+  }
+
+  if (activeFlow?.mode === "rent_report_reject_comment") {
+    if (!canManageRentals(me)) {
+      state.delete(ctx.from.id);
+      await ctx.reply("<b>Нет доступа.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const report = getRentReportById(activeFlow.payload.reportId);
+    const rental = report ? getRentalById(Number(report.rental_id)) : null;
+    const renter = report ? getUserById(Number(report.user_id)) : null;
+    if (!report || !rental || !renter) {
+      state.delete(ctx.from.id);
+      await ctx.reply("<b>Отчет не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const comment = trimmed.slice(0, 1000) || "Без комментария.";
+    report.status = activeFlow.payload.requestRepeat ? "RETRY_REQUESTED" : "REJECTED";
+    report.admin_comment = comment;
+    report.reviewed_at = nowIso();
+    report.reviewed_by_user_id = me.id;
+    if (activeFlow.payload.requestRepeat) {
+      report.deadline_at = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      rental.report_deadline_at = report.deadline_at;
+    }
+    saveState();
+    state.delete(ctx.from.id);
+
+    if (activeFlow.payload.requestRepeat && renter.tg_id) {
+      await ctx.telegram.sendMessage(
+        Number(renter.tg_id),
+        `<b>Ваш отчет по аренде аккаунта №${rental.number} отклонен.</b>\n\nКомментарий: <b>${escapeHtml(comment)}</b>\n\nНажмите кнопку ниже и отправьте новый скрин игр. На повторный отчет снова есть 24 часа.`,
+        {
+          parse_mode: "HTML",
+          reply_markup: Markup.inlineKeyboard([[Markup.button.callback("📸 Отправить отчет повторно", `rent:report:upload:${report.id}`)]]).reply_markup,
+        },
+      ).catch(() => null);
+    }
+
+    await ctx.reply("<b>Отменить аренду?</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Да", `rent:report:cancel_yes:${report.id}`),
+          Markup.button.callback("❌ Нет", `rent:report:cancel_no:${report.id}`),
+        ],
+      ]).reply_markup,
+    }).catch(() => null);
+    logEvent(me, "rent_report", `reject_comment:${report.id}:repeat:${activeFlow.payload.requestRepeat}`);
+    return;
+  }
+
+  if (isDrawBtn || isOnlineBtn || isSettingsBtn || isRentalsBtn) {
     if (isDrawBtn) {
       await clearUserFlowOnly(ctx);
       await renderDrawMenu(ctx);
       logEvent(me, "draw", "open_menu");
+      return;
+    }
+    if (isRentalsBtn) {
+      await clearUserFlowOnly(ctx);
+      if (hasAcceptedRentRules(me.id)) {
+        await renderRentalsMenu(ctx);
+      } else {
+        await renderRentalsRules(ctx);
+      }
+      logEvent(me, "rentals", "open_menu");
       return;
     }
     if (isSettingsBtn) {
@@ -2482,11 +3461,7 @@ bot.on("text", async (ctx) => {
     }
     await clearUserFlowOnly(ctx);
     state.set(ctx.from.id, { mode: "online_watch_profile_input" });
-    await sendPersistentPrompt(
-      ctx,
-      `<tg-emoji emoji-id="5242657215751426928">🟢</tg-emoji> <b>Чекер онлайна.</b> Отправляет уведомление, когда нужный профиль появляется в сети\n\n<tg-emoji emoji-id="5240446651918753852">🔗</tg-emoji> Пришлите ссылку на профиль/SteamID`,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
-    );
+    await renderOnlineWatchPrompt(ctx);
     return;
   }
 
@@ -2605,6 +3580,406 @@ bot.on("callback_query", async (ctx, next) => {
     return;
   }
 
+  if (data === "online_watch:menu") {
+    state.set(ctx.from.id, { mode: "online_watch_profile_input" });
+    await renderOnlineWatchPrompt(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "online_watch:list") {
+    await renderOnlineWatchList(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "online_watch:clear") {
+    state.delete(ctx.from.id);
+    await clearOnlineWatchRowsForUser(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:list") {
+    state.delete(ctx.from.id);
+    await renderRentalsList(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:rules_accept:")) {
+    state.delete(ctx.from.id);
+    const availableAt = Number(data.split(":")[2] || 0);
+    const secondsLeft = Math.ceil((availableAt - Date.now()) / 1000);
+    if (secondsLeft > 0) {
+      await ctx.answerCbQuery(`Правила можно подтвердить через ${secondsLeft} сек.`, { show_alert: true }).catch(() => null);
+      return;
+    }
+    setRentRulesAccepted(me.id);
+    await renderRentalsList(ctx, me);
+    await ctx.answerCbQuery("Раздел открыт").catch(() => null);
+    return;
+  }
+
+  if (data === "rent:back_main") {
+    state.delete(ctx.from.id);
+    await showMainMenu(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:view:")) {
+    state.delete(ctx.from.id);
+    await renderRentalCard(ctx, Number(data.split(":")[2] || 0));
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:take:")) {
+    state.delete(ctx.from.id);
+    const rental = getRentalByNumber(Number(data.split(":")[2] || 0));
+    if (!rental) {
+      await ctx.answerCbQuery("Аккаунт не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    if (Number(rental.is_busy || 0) === 1 && Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+      await ctx.answerCbQuery("Аккаунт уже занят", { show_alert: true }).catch(() => null);
+      await renderRentalCard(ctx, Number(rental.number));
+      return;
+    }
+    if (Number(rental.is_busy || 0) === 1 && Number(rental.rented_by_user_id || 0) === Number(me.id)) {
+      await ctx.reply(`<b>Этот аккаунт уже арендован вами.</b>\nПолучить код для входа: <code>/guard ${rental.number}</code>`, {
+        parse_mode: "HTML",
+      }).catch(() => null);
+      await ctx.answerCbQuery("Уже арендован").catch(() => null);
+      return;
+    }
+    createRentDiscordPending(rental, me);
+    state.set(ctx.from.id, { mode: "rent_discord_handoff", payload: { rentalNumber: Number(rental.number) } });
+    logEvent(me, "rentals", `discord_handoff:${rental.number}`);
+    await replaceOrReply(ctx, formatDiscordRentalInstruction(rental), {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", `rent:view:${rental.number}`)]]).reply_markup,
+    });
+    await ctx.answerCbQuery("Подтвердите Discord").catch(() => null);
+    return;
+  }
+
+  if (/^rent:req:(approve|decline):\d+:\d+$/.test(data)) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const parts = data.split(":");
+    const action = parts[2];
+    const rental = getRentalByNumber(Number(parts[3] || 0));
+    const requester = getUserById(Number(parts[4] || 0));
+    if (!rental || !requester) {
+      await ctx.answerCbQuery("Заявка не найдена", { show_alert: true }).catch(() => null);
+      return;
+    }
+
+    if (action === "decline") {
+      await clearRentalRequestMessages(ctx, rental, requester);
+      await ctx.telegram.sendMessage(Number(requester.tg_id), `<b>Заявка на аренду отклонена.</b>\nАккаунт: <b>№${rental.number}</b>`, {
+        parse_mode: "HTML",
+      }).catch(() => null);
+      await ctx.answerCbQuery("Отклонено").catch(() => null);
+      logEvent(me, "rentals", `decline:${rental.number}:user:${requester.id}`);
+      return;
+    }
+
+    if (Number(rental.is_busy || 0) === 1 && Number(rental.rented_by_user_id || 0) !== Number(requester.id)) {
+      await ctx.answerCbQuery("Аккаунт уже занят", { show_alert: true }).catch(() => null);
+      return;
+    }
+
+    rental.is_busy = 1;
+    rental.rented_by_user_id = requester.id;
+    ensureGuardAttempt(Number(rental.id), Number(requester.id), 1);
+    saveState();
+    await clearRentalRequestMessages(ctx, rental, requester);
+    await ctx.telegram.sendMessage(
+      Number(requester.tg_id),
+      `<b>Одобрена аренда</b>\n` +
+        `Номер аккаунта: <b>№${rental.number}</b>\n` +
+        `Логин: <code>${escapeHtml(String(rental.login || "-"))}</code>\n` +
+        `Пароль: <code>${escapeHtml(String(rental.pass || "-"))}</code>\n` +
+        `Получить код для входа: <code>/guard ${rental.number}</code>`,
+      { parse_mode: "HTML" },
+    ).catch(() => null);
+    await ctx.answerCbQuery("Одобрено").catch(() => null);
+    logEvent(me, "rentals", `approve:${rental.number}:user:${requester.id}`);
+    return;
+  }
+
+  if (data.startsWith("rent:report:upload:")) {
+    const report = getRentReportById(Number(data.split(":")[3] || 0));
+    const rental = report ? getRentalById(Number(report.rental_id)) : null;
+    if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+      await ctx.answerCbQuery("Запрос отчета не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, { mode: "rent_report_upload", payload: { reportId: Number(report.id) } });
+    await replaceOrReply(ctx, `<b>Пришлите скрин списка игр по аккаунту №${rental.number}.</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "rent:list")]]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:report:approve:")) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const report = getRentReportById(Number(data.split(":")[3] || 0));
+    const rental = report ? getRentalById(Number(report.rental_id)) : null;
+    const renter = report ? getUserById(Number(report.user_id)) : null;
+    if (!report || !rental || !renter) {
+      await ctx.answerCbQuery("Отчет не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    report.status = "APPROVED";
+    report.reviewed_at = nowIso();
+    report.reviewed_by_user_id = me.id;
+    rental.report_deadline_at = null;
+    saveState();
+    if (renter.tg_id) {
+      await ctx.telegram.sendMessage(Number(renter.tg_id), `<b>Отчет по аренде аккаунта №${rental.number} одобрен.</b>`, {
+        parse_mode: "HTML",
+      }).catch(() => null);
+    }
+    await ctx.answerCbQuery("Отчет одобрен").catch(() => null);
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => null);
+    logEvent(me, "rent_report", `approve:${report.id}:rental:${rental.number}`);
+    return;
+  }
+
+  if (data.startsWith("rent:report:reject:")) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступ", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const reportId = Number(data.split(":")[3] || 0);
+    const report = getRentReportById(reportId);
+    if (!report) {
+      await ctx.answerCbQuery("Отчет не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await ctx.reply("<b>Запросить отчет повторно?</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Да", `rent:report:repeat_yes:${reportId}`),
+          Markup.button.callback("❌ Нет", `rent:report:repeat_no:${reportId}`),
+        ],
+      ]).reply_markup,
+    }).catch(() => null);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:report:repeat_yes:") || data.startsWith("rent:report:repeat_no:")) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const requestRepeat = data.startsWith("rent:report:repeat_yes:");
+    const reportId = Number(data.split(":")[3] || 0);
+    if (!getRentReportById(reportId)) {
+      await ctx.answerCbQuery("Отчет не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, { mode: "rent_report_reject_comment", payload: { reportId, requestRepeat } });
+    await replaceOrReply(ctx, "<b>Укажите комментарий администратора/помощника.</b>", { parse_mode: "HTML" });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:report:cancel_yes:") || data.startsWith("rent:report:cancel_no:")) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const shouldCancel = data.startsWith("rent:report:cancel_yes:");
+    const report = getRentReportById(Number(data.split(":")[3] || 0));
+    const rental = report ? getRentalById(Number(report.rental_id)) : null;
+    const renter = report ? getUserById(Number(report.user_id)) : null;
+    if (!report || !rental) {
+      await ctx.answerCbQuery("Отчет не найден", { show_alert: true }).catch(() => null);
+      return;
+    }
+    if (shouldCancel) {
+      cancelRental(rental);
+      if (renter?.tg_id) {
+        await ctx.telegram.sendMessage(Number(renter.tg_id), `<b>Аренда аккаунта №${rental.number} отменена.</b>`, {
+          parse_mode: "HTML",
+        }).catch(() => null);
+      }
+      logEvent(me, "rent_report", `cancel:${report.id}:rental:${rental.number}`);
+      await replaceOrReply(ctx, "<b>Аренда отменена.</b>", { parse_mode: "HTML" });
+    } else {
+      await replaceOrReply(ctx, "<b>Аренда оставлена активной.</b>", { parse_mode: "HTML" });
+    }
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:manage") {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderRentalsManage(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:responsible") {
+    state.delete(ctx.from.id);
+    if (!hasRole(me, ["ADMIN"])) {
+      await ctx.answerCbQuery("Только администраторы", { show_alert: true }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, { mode: "rent_set_responsible" });
+    await replaceOrReply(ctx, "<b>Пришлите Telegram username ответственного.</b>\nНапример: <code>@username</code>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "rent:manage")]]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:cancel") {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderRentalsCancelMenu(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:cancel:")) {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const rental = getRentalByNumber(Number(data.split(":")[2] || 0));
+    if (!rental || Number(rental.is_busy || 0) !== 1) {
+      await ctx.answerCbQuery("Активная аренда не найдена", { show_alert: true }).catch(() => null);
+      await renderRentalsCancelMenu(ctx);
+      return;
+    }
+    const renter = getUserById(Number(rental.rented_by_user_id || 0));
+    cancelRental(rental);
+    if (renter?.tg_id) {
+      await ctx.telegram.sendMessage(Number(renter.tg_id), `<b>Аренда аккаунта №${rental.number} отменена.</b>`, {
+        parse_mode: "HTML",
+      }).catch(() => null);
+    }
+    logEvent(me, "rentals", `cancel:${rental.number}:user:${renter?.id || 0}`);
+    await ctx.answerCbQuery("Аренда отменена").catch(() => null);
+    await renderRentalsCancelMenu(ctx);
+    return;
+  }
+
+  if (data === "rent:add") {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    state.set(ctx.from.id, { mode: "rent_add_title" });
+    await replaceOrReply(ctx, "<b>Введите название аккаунта.</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "rent:manage")]]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:delete") {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderRentalsDeleteMenu(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:delete_all") {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const count = removeAllRentals();
+    logEvent(me, "rentals", `delete_all:${count}`);
+    await renderRentalsDeleteMenu(ctx);
+    await ctx.answerCbQuery(`Удалено: ${count}`).catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("rent:delete:")) {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const number = Number(data.split(":")[2] || 0);
+    const changes = removeRentalByNumber(number);
+    logEvent(me, "rentals", `delete:${number}`);
+    await renderRentalsDeleteMenu(ctx);
+    await ctx.answerCbQuery(changes ? "Удалено" : "Не найдено").catch(() => null);
+    return;
+  }
+
+  if (data === "rent:edit") {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderRentalsEditList(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (/^rent:edit:\d+$/.test(data)) {
+    state.delete(ctx.from.id);
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderRentalEditFields(ctx, Number(data.split(":")[2] || 0));
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (/^rent:edit:\d+:(title|description)$/.test(data)) {
+    if (!canManageRentals(me)) {
+      await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
+      return;
+    }
+    const parts = data.split(":");
+    const number = Number(parts[2] || 0);
+    const field = parts[3] as "title" | "description";
+    state.set(ctx.from.id, { mode: "rent_edit_input", payload: { number, field } });
+    await replaceOrReply(ctx, field === "title" ? "<b>Введите новое название.</b>" : "<b>Введите новое описание.</b>", {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", `rent:edit:${number}`)]]).reply_markup,
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
   if (data.startsWith("admin:userlist:page:") && hasRole(me, ["ADMIN"])) {
     await renderAdminUsersPage(ctx, Number(data.split(":").pop() || 0));
     await ctx.answerCbQuery().catch(() => null);
@@ -2651,6 +4026,22 @@ bot.on("callback_query", async (ctx, next) => {
     return;
   }
 
+  if (data.startsWith("admin:role:") && hasRole(me, ["ADMIN"])) {
+    const parts = data.split(":");
+    const userId = Number(parts[2] || 0);
+    const role = String(parts[3] || "") as Role;
+    const page = Number(parts[4] || 0);
+    const target = toggleUserRole(userId, role);
+    if (!target) {
+      await ctx.answerCbQuery("Роль или пользователь не найдены", { show_alert: true }).catch(() => null);
+      return;
+    }
+    await renderAdminUserCard(ctx, target, page);
+    await ctx.answerCbQuery("Роли обновлены").catch(() => null);
+    logEvent(me, "admin_role", `user:${userId}:role:${role}`);
+    return;
+  }
+
   if (data === "logs:search" && hasRole(me, ["ADMIN"])) {
     state.set(ctx.from.id, { mode: "admin_logs_search" });
     await replaceOrReply(ctx, `<b>Введите слово для поиска по логам.</b>`, { parse_mode: "HTML" });
@@ -2689,11 +4080,16 @@ bot.on("callback_query", async (ctx, next) => {
 
   if (data === "draw:acc_blocked" || data === "draw:steam_guard_error") {
     const mode = data === "draw:acc_blocked" ? "acc_blocked" : "steam_guard_error";
+    const modeTitle = mode === "acc_blocked" ? "⛔ Account Blocked" : "🛡️ Steam Guard Error";
+    const modeDescription =
+      mode === "acc_blocked"
+        ? "отрисовка окна блокировки аккаунта для Steam-профиля"
+        : "отрисовка ошибки Steam Guard для Steam-профиля";
     state.set(ctx.from.id, {
       mode: `draw_input:${mode}` as "draw_input:acc_blocked" | "draw_input:steam_guard_error",
       payload: { variant: "id", promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
-    await replaceOrReply(ctx, `<b>Пришлите ссылку на профиль или SteamID.</b>`, {
+    await renderPhotoPrompt(ctx, mode === "acc_blocked" ? DRAW_ACC_BLOCKED_IMAGE_PATH : DRAW_STEAM_GUARD_ERROR_IMAGE_PATH, `<blockquote>${modeTitle}\n     ╰ ${modeDescription}</blockquote>\n\n👀 Отправь ссылку на профиль или SteamID:\n\n❗️ Для корректной работы отрисовщика, сначала проверьте профиль и следом скопируйте адрес из адресной строки`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
     });
@@ -2703,9 +4099,10 @@ bot.on("callback_query", async (ctx, next) => {
 
   if (data === "draw:add_friend") {
     const base = data.split(":")[1];
-    await replaceOrReply(
+    await renderPhotoPrompt(
       ctx,
-      `<b>Что предоставил мамонт?</b>`,
+      DRAW_ADD_FRIEND_IMAGE_PATH,
+      `<blockquote>👥 Add Friend\n     ╰ отрисовка ошибки добавления в друзья</blockquote>\n\n👀 Выбери, что предоставил мамонт:`,
       {
         parse_mode: "HTML",
         reply_markup: Markup.inlineKeyboard([
@@ -2726,7 +4123,13 @@ bot.on("callback_query", async (ctx, next) => {
       mode: `draw_input:${mode}` as any,
       payload: { variant, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
-    await replaceOrReply(ctx, `<b>Пришлите ссылку на профиль или SteamID.</b>`, {
+    const imagePath =
+      mode === "acc_blocked"
+        ? DRAW_ACC_BLOCKED_IMAGE_PATH
+        : mode === "steam_guard_error"
+          ? DRAW_STEAM_GUARD_ERROR_IMAGE_PATH
+          : DRAW_ADD_FRIEND_IMAGE_PATH;
+    await renderPhotoPrompt(ctx, imagePath, `<blockquote>👥 Add Friend\n     ╰ отрисовка ошибки добавления в друзья по данным профиля</blockquote>\n\n👀 Отправь ссылку на профиль или SteamID:\n\n❗️ Для корректной работы отрисовщика, сначала проверьте профиль и следом скопируйте адрес из адресной строки`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", `draw:${mode}`)]]).reply_markup,
     });
@@ -2735,7 +4138,7 @@ bot.on("callback_query", async (ctx, next) => {
   }
 
   if (data === "draw:code_dota2" || data === "draw:ban_dota2") {
-    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
+    await renderPhotoPrompt(ctx, DRAW_CODE_DOTA2_IMAGE_PATH, `<blockquote>🔑 DOTA 2 Code\n     ╰ отрисовка кода DOTA 2 в выбранном режиме</blockquote>\n\n👀 Выбери режим:`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([
         [
@@ -2752,7 +4155,12 @@ bot.on("callback_query", async (ctx, next) => {
   if (data === "draw:code_dota2:fake") {
     state.delete(ctx.from.id);
     await ctx.answerCbQuery().catch(() => null);
-    await runDrawJob(ctx, makeDota2FakeCodeScreenshot, "Не удалось отправить скриншот кода DOTA 2.");
+    await runDrawJob(
+      ctx,
+      makeDota2FakeCodeScreenshot,
+      "Не удалось отправить скриншот кода DOTA 2.",
+      Number((ctx.callbackQuery as any)?.message?.message_id || 0),
+    );
     return;
   }
 
@@ -2761,48 +4169,9 @@ bot.on("callback_query", async (ctx, next) => {
       mode: "draw_input:code_dota2_mammoth_code",
       payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
-    await replaceOrReply(ctx, `<b>Введите код мамонта.</b>`, {
+    await renderPhotoPrompt(ctx, DRAW_CODE_DOTA2_IMAGE_PATH, `<blockquote>🔎 DOTA 2 Code Not Found\n     ╰ отрисовка ошибки поиска по коду DOTA 2</blockquote>\n\n👀 Отправь код мамонта:`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:code_dota2")]]).reply_markup,
-    });
-    await ctx.answerCbQuery().catch(() => null);
-    return;
-  }
-
-  if (data === "draw:ban_cs2") {
-    state.set(ctx.from.id, {
-      mode: "draw_input:ban_cs2",
-      payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
-    });
-    await replaceOrReply(ctx, `<b>Введите ссылку на профиль.</b>`, {
-      parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
-    });
-    await ctx.answerCbQuery().catch(() => null);
-    return;
-  }
-
-  if (data === "draw:code_cs2") {
-    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
-      parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback("🔎 Не найдено", "draw:code_cs2:not_found"), Markup.button.callback("🎭 Фейк-код", "draw:code_cs2:fake")],
-        [Markup.button.callback("⬅️ Назад", "draw:menu")],
-      ]).reply_markup,
-    });
-    await ctx.answerCbQuery().catch(() => null);
-    return;
-  }
-
-  if (data.startsWith("draw:code_cs2:")) {
-    const variant = data.endsWith(":not_found") ? "not_found" : "fake";
-    state.set(ctx.from.id, {
-      mode: "draw_input:code_cs2",
-      payload: { variant, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
-    });
-    await replaceOrReply(ctx, `<b>Введите ссылку на профиль.</b>`, {
-      parse_mode: "HTML",
-      reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:code_cs2")]]).reply_markup,
     });
     await ctx.answerCbQuery().catch(() => null);
     return;
@@ -2818,7 +4187,7 @@ bot.on("callback_query", async (ctx, next) => {
       mode: "draw_input:qr_page_time",
       payload: { inviteLink: phishingLink, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
     });
-    await replaceOrReply(ctx, `<b>Введите время для скриншота.</b>`, {
+    await renderPhotoPrompt(ctx, DRAW_QR_PAGE_IMAGE_PATH, `<blockquote>📱 QR Friend Page\n     ╰ отрисовка QR-кода на странице друзей с твоим фейком</blockquote>\n\n👀 Отправь время для скриншота:\n\n❗️ Для корректной работы отрисовщика, сначала зайдите сами на ссылку и следом скопируйте адрес из адресной строки`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:menu")]]).reply_markup,
     });
@@ -2827,7 +4196,7 @@ bot.on("callback_query", async (ctx, next) => {
   }
 
   if (data === "draw:friend_page") {
-    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
+    await renderPhotoPrompt(ctx, DRAW_FRIEND_PAGE_IMAGE_PATH, `<blockquote>🧾 Friend Page\n     ╰ отрисовка страницы друга в выбранном режиме</blockquote>\n\n👀 Выбери режим:`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.callback("✅ Обычный", "draw:friend_page:normal"), Markup.button.callback("🔎 Не найдено", "draw:friend_page:not_found")],
@@ -2839,7 +4208,7 @@ bot.on("callback_query", async (ctx, next) => {
   }
 
   if (data === "draw:friend_page:not_found") {
-    await replaceOrReply(ctx, `<b>Выберите режим.</b>`, {
+    await renderPhotoPrompt(ctx, DRAW_FRIEND_PAGE_IMAGE_PATH, `<blockquote>🔎 Friend Page Not Found\n     ╰ отрисовка ошибки поиска друга по коду</blockquote>\n\n👀 Выбери тип ошибки:`, {
       parse_mode: "HTML",
       reply_markup: Markup.inlineKeyboard([
         [
@@ -2861,7 +4230,7 @@ bot.on("callback_query", async (ctx, next) => {
         mode: "draw_input:friend_page_normal_link",
         payload: { promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
       });
-      await replaceOrReply(ctx, `<b>Введите фишинг-ссылку.</b>`, {
+      await renderPhotoPrompt(ctx, DRAW_FRIEND_PAGE_IMAGE_PATH, `<blockquote>🧾 Friend Page\n     ╰ отрисовка обычной страницы друга с твоим фейком</blockquote>\n\n👀 Отправь fake-invite ссылку:\n\n❗️ Для корректной работы отрисовщика, сначала зайдите сами на ссылку и следом скопируйте адрес из адресной строки`, {
         parse_mode: "HTML",
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:friend_page")]]).reply_markup,
       });
@@ -2878,7 +4247,7 @@ bot.on("callback_query", async (ctx, next) => {
         mode: "draw_input:friend_page_code",
         payload: { inviteLink: phishingLink, showRegionMismatch, promptMessageId: (ctx.callbackQuery as any)?.message?.message_id || null },
       });
-      await replaceOrReply(ctx, `<b>Введите код друга мамонта.</b>`, {
+      await renderPhotoPrompt(ctx, DRAW_FRIEND_PAGE_IMAGE_PATH, `<blockquote>🔎 Friend Code Not Found\n     ╰ отрисовка ошибки поиска друга по коду</blockquote>\n\n👀 Отправь код друга мамонта:`, {
         parse_mode: "HTML",
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "draw:friend_page:not_found")]]).reply_markup,
       });
@@ -2894,6 +4263,8 @@ async function startBot() {
   await cleanupSteamTempDirs();
   await syncBotCommands();
   startOnlineWatchLoop();
+  startRentReportLoop();
+  startRentDiscordBridgeLoop();
   warmupSteamRenderer().catch(() => null);
   await bot.launch();
   console.log("Bot started");

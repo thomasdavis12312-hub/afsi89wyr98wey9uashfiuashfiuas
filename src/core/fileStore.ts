@@ -37,12 +37,15 @@ type NotificationPrefsRow = {
   notif_panel: number;
   notif_rent: number;
   phishing_link?: string | null;
+  rent_rules_accepted?: number;
 };
 
 type AppStoreState = {
   users: UserRow[];
   user_roles: Array<{ id: number; user_id: number; role: string }>;
   rentals: AnyRow[];
+  rent_reports: AnyRow[];
+  rent_discord_pending: AnyRow[];
   guard_attempts: AnyRow[];
   online_watch: AnyRow[];
   work_requests: AnyRow[];
@@ -63,6 +66,8 @@ function normalizeState(raw: any): AppStoreState {
     users: [],
     user_roles: [],
     rentals: [],
+    rent_reports: [],
+    rent_discord_pending: [],
     guard_attempts: [],
     online_watch: [],
     work_requests: [],
@@ -77,6 +82,8 @@ function normalizeState(raw: any): AppStoreState {
   state.users = Array.isArray(state.users) ? state.users : [];
   state.user_roles = Array.isArray(state.user_roles) ? state.user_roles : [];
   state.rentals = Array.isArray(state.rentals) ? state.rentals : [];
+  state.rent_reports = Array.isArray(state.rent_reports) ? state.rent_reports : [];
+  state.rent_discord_pending = Array.isArray(state.rent_discord_pending) ? state.rent_discord_pending : [];
   state.guard_attempts = Array.isArray(state.guard_attempts) ? state.guard_attempts : [];
   state.online_watch = Array.isArray(state.online_watch) ? state.online_watch : [];
   state.work_requests = Array.isArray(state.work_requests) ? state.work_requests : [];
@@ -168,32 +175,38 @@ export function createFileStoreDatabase(filePathRaw: string) {
         notif_panel: 1,
         notif_rent: 1,
         phishing_link: null,
+        rent_rules_accepted: 0,
       };
       state.notification_prefs.push(row);
       schedulePersist();
-    } else if (!("phishing_link" in row)) {
-      row.phishing_link = null;
-      schedulePersist();
+    } else {
+      let changed = false;
+      if (!("phishing_link" in row)) {
+        row.phishing_link = null;
+        changed = true;
+      }
+      if (!("rent_rules_accepted" in row)) {
+        row.rent_rules_accepted = 0;
+        changed = true;
+      }
+      if (changed) schedulePersist();
     }
     return row;
   };
 
   const getUserById = (userId: number) => state.users.find((row) => Number(row.id) === Number(userId)) || null;
   const getUserByTgId = (tgId: number) => state.users.find((row) => Number(row.tg_id) === Number(tgId)) || null;
-  const getUserByQuery = (query: string | number) => {
-    const raw = String(query || "").trim();
-    const numericId = Number(raw || -1);
-    return (
-      state.users.find((row) => Number(row.id) === numericId) ||
-      state.users.find((row) => lowercase(row.discord_tag) === lowercase(raw)) ||
-      state.users.find((row) => lowercase(row.tg_username) === lowercase(raw.replace(/^@/, ""))) ||
-      null
-    );
-  };
 
   const api = {
     store: {
       getState: () => state,
+      reloadNow: () => {
+        state = normalizeState(
+          fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : null,
+        );
+        state.users = state.users.map((row) => normalizeUser(row));
+        return state;
+      },
       saveNow: () => persist(),
       ensureUserPrefs,
       getPendingWorkRequests: () =>
@@ -485,7 +498,7 @@ export function createFileStoreDatabase(filePathRaw: string) {
           all: () => {
             const needWork = upper.includes("NP.NOTIF_WORK");
             const needPanel = upper.includes("NP.NOTIF_PANEL");
-            const roles = upper.includes("R.ROLE IN ('ADMIN','DOBIVER')") ? new Set(["ADMIN", "DOBIVER"]) : new Set(["ADMIN"]);
+            const roles = upper.includes("R.ROLE IN ('ADMIN','HELPER')") ? new Set(["ADMIN", "HELPER"]) : new Set(["ADMIN"]);
             const seen = new Set<number>();
             const rows: Array<{ tg_id: number }> = [];
             for (const roleRow of state.user_roles) {
