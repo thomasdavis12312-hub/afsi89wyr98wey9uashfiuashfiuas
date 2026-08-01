@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Input, Markup, Telegraf } from "telegraf";
+import { EAuthSessionGuardType, EAuthTokenPlatformType, LoginSession } from "steam-session";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -32,6 +33,7 @@ type UserFlow =
   | { mode: "admin_logs_search" }
   | { mode: "admin_find_user"; payload: { returnPage: number } }
   | { mode: "admin_broadcast_input" }
+  | { mode: "admin_steam_proxy_input" }
   | { mode: "draw_input:add_friend"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:acc_blocked"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
   | { mode: "draw_input:steam_guard_error"; payload: { variant: "link" | "id"; promptMessageId: number | null } }
@@ -81,10 +83,15 @@ const uiPromptMsg = new Map<number, number>();
 const adminLogsViewState = new Map<number, { query: string }>();
 const onlineWatchRuntime = new Map<number, RuntimeWatch>();
 const onlineWatchProbeState = new Map<number, { lastStatusCheckAt: number; onlineStreak: number }>();
+const steamTerminationInFlight = new Map<string, Promise<boolean>>();
+const steamTerminationCooldownUntil = new Map<string, number>();
+const steamProxyFailureUntil = new Map<string, number>();
 const activeBroadcasts = new Set<string>();
 let onlineWatchLoopStarted = false;
 let rentReportLoopStarted = false;
 let rentDiscordBridgeLoopStarted = false;
+let steamProxyLastUrl = "";
+let steamProxyOverrideUrl: string | null = null;
 
 const steamIdResolveCache = new Map<string, { steamId: string; updatedAt: number }>();
 const invitePageCache = new Map<string, InvitePageData & { updatedAt: number }>();
@@ -93,6 +100,8 @@ const STEAM_SCREENSHOT_CLIP_DEFAULT = { x: 0, y: 122, width: 1920, height: 810 }
 const STEAM_SCREENSHOT_CLIP_WITH_HEADER = { x: 0, y: 0, width: 1920, height: 932 };
 const STEAM_FRIEND_TEMPLATE_VIEWPORT = { width: 1920, height: 1080 };
 const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
+const RENT_REPORT_HOUR_MSK = 21;
+const RENT_REPORT_MINUTE_MSK = 0;
 
 let steamBrowser: any = null;
 let steamPage: any = null;
@@ -250,6 +259,50 @@ function parseHttpUrl(raw: string) {
   }
 }
 
+function photoCache() {
+  const stateData = appState() as any;
+  if (!stateData.telegram_photo_cache || typeof stateData.telegram_photo_cache !== "object") {
+    stateData.telegram_photo_cache = {};
+  }
+  return stateData.telegram_photo_cache as Record<string, string>;
+}
+
+function cachedPhotoMedia(imagePath: string) {
+  return photoCache()[path.basename(imagePath)] || Input.fromLocalFile(imagePath);
+}
+
+function rememberPhotoFileId(imagePath: string, message: any) {
+  const photos = Array.isArray(message?.photo) ? message.photo : [];
+  const fileId = photos[photos.length - 1]?.file_id;
+  if (!fileId) return;
+  const cache = photoCache();
+  if (cache[path.basename(imagePath)] === fileId) return;
+  cache[path.basename(imagePath)] = fileId;
+  saveState();
+}
+
+async function replyWithCachedPhoto(ctx: Ctx, imagePath: string, extra: any) {
+  const sent = await ctx.replyWithPhoto(cachedPhotoMedia(imagePath), extra);
+  rememberPhotoFileId(imagePath, sent);
+  return sent;
+}
+
+async function editCachedPhotoMedia(ctx: Ctx, imagePath: string, caption: string, extra?: any) {
+  if (ctx.updateType !== "callback_query" || typeof ctx.editMessageMedia !== "function") return false;
+  return ctx
+    .editMessageMedia(
+      {
+        type: "photo",
+        media: cachedPhotoMedia(imagePath),
+        caption,
+        parse_mode: extra?.parse_mode,
+      },
+      extra?.reply_markup ? { reply_markup: extra.reply_markup } : undefined,
+    )
+    .then(() => true)
+    .catch(() => false);
+}
+
 async function renderSettingsMenu(ctx: Ctx, user: any) {
   const phishingLink = getUserPhishingLink(user.id);
   const caption = `<b>⚙️ Настройки</b>\n\nФишинг-ссылка: <b>${phishingLink ? escapeHtml(phishingLink) : "не установлена"}</b>`;
@@ -260,23 +313,9 @@ async function renderSettingsMenu(ctx: Ctx, user: any) {
     ]).reply_markup,
   };
 
-  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
-    const edited = await ctx
-      .editMessageMedia(
-        {
-          type: "photo",
-          media: Input.fromLocalFile(SETTINGS_IMAGE_PATH),
-          caption,
-          parse_mode: "HTML",
-        },
-        { reply_markup: extra.reply_markup },
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (edited) return;
-  }
+  if (await editCachedPhotoMedia(ctx, SETTINGS_IMAGE_PATH, caption, extra)) return;
 
-  await ctx.replyWithPhoto(Input.fromLocalFile(SETTINGS_IMAGE_PATH), {
+  await replyWithCachedPhoto(ctx, SETTINGS_IMAGE_PATH, {
     ...extra,
     caption,
   }).catch(() => null);
@@ -307,12 +346,11 @@ async function showMainMenu(ctx: Ctx, user: any, text?: string) {
     `<tg-emoji emoji-id="5242732781406033436">👋</tg-emoji> Добро пожаловать в <a href="https://discord.gg/criminalchina"><b>CC TEAM BOT</b></a>.\n` +
       `╰ Пользователей в боте: <b>${approvedCount}</b>`;
   if (!text) {
-    await ctx
-      .replyWithPhoto(Input.fromLocalFile(WELCOME_IMAGE_PATH), {
-        ...getMainKeyboard(user),
-        caption: message,
-        parse_mode: "HTML",
-      })
+    await replyWithCachedPhoto(ctx, WELCOME_IMAGE_PATH, {
+      ...getMainKeyboard(user),
+      caption: message,
+      parse_mode: "HTML",
+    })
       .catch(() => null);
     return;
   }
@@ -385,30 +423,14 @@ async function replaceOrReply(ctx: Ctx, text: string, extra?: any) {
 }
 
 async function renderPhotoPrompt(ctx: Ctx, imagePath: string, caption: string, extra?: any) {
-  const mediaExtra = extra?.reply_markup ? { reply_markup: extra.reply_markup } : undefined;
-
-  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
-    const editedMedia = await ctx
-      .editMessageMedia(
-        {
-          type: "photo",
-          media: Input.fromLocalFile(imagePath),
-          caption,
-          parse_mode: extra?.parse_mode,
-        },
-        mediaExtra,
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (editedMedia) return true;
-  }
+  if (await editCachedPhotoMedia(ctx, imagePath, caption, extra)) return true;
 
   if (ctx.updateType === "callback_query" && typeof ctx.editMessageCaption === "function") {
     const editedCaption = await ctx.editMessageCaption(caption, extra).then(() => true).catch(() => false);
     if (editedCaption) return true;
   }
 
-  await ctx.replyWithPhoto(Input.fromLocalFile(imagePath), {
+  await replyWithCachedPhoto(ctx, imagePath, {
     ...(extra || {}),
     caption,
   }).catch(async () => {
@@ -889,6 +911,37 @@ async function renderAdminStats(ctx: Ctx, range: StatsRangeKey) {
   await replaceOrReply(ctx, text, { parse_mode: "HTML", reply_markup: kb });
 }
 
+async function renderAdminSteamProxy(ctx: Ctx) {
+  const proxies = steamProxyList();
+  await replaceOrReply(
+    ctx,
+    `<b>Steam \u043f\u0440\u043e\u043a\u0441\u0438</b>\n\n\u0420\u0435\u0436\u0438\u043c: <b>${escapeHtml(steamProxyStatusText())}</b>\n\u0412\u0441\u0435\u0433\u043e \u043f\u0440\u043e\u043a\u0441\u0438: <b>${proxies.length}</b>\n\n\u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u043f\u0430\u0447\u043a\u043e\u0439: \u043a\u0430\u0436\u0434\u044b\u0439 \u043f\u0440\u043e\u043a\u0441\u0438 \u0441 \u043d\u043e\u0432\u043e\u0439 \u0441\u0442\u0440\u043e\u043a\u0438:\n<code>user:pass@host:port</code>\n<code>socks5://user:pass@host:port</code>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback("\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u043f\u0440\u043e\u043a\u0441\u0438", "admin:steam_proxy:set")],
+        [Markup.button.callback("\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043f\u0440\u043e\u043a\u0441\u0438", "admin:steam_proxy:delete_menu")],
+        [Markup.button.callback("\u041e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0432\u0441\u0435", "admin:steam_proxy:clear")],
+      ]).reply_markup,
+    },
+  );
+}
+
+async function renderAdminSteamProxyDeleteMenu(ctx: Ctx) {
+  const proxies = steamProxyList();
+  const rows = proxies.map((proxy, index) => [
+    Markup.button.callback(`${index + 1}. ${maskedProxyValue(proxy.url)}`, `admin:steam_proxy:delete:${proxy.id}`),
+  ]);
+  await replaceOrReply(ctx, proxies.length ? "<b>\u0423\u0434\u0430\u043b\u0435\u043d\u0438\u0435 Steam \u043f\u0440\u043e\u043a\u0441\u0438</b>" : "<b>\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0443\u0441\u0442.</b>", {
+    parse_mode: "HTML",
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback("\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435", "admin:steam_proxy:delete_all")],
+      ...rows,
+      [Markup.button.callback("\u041d\u0430\u0437\u0430\u0434", "admin:steam_proxy")],
+    ]).reply_markup,
+  });
+}
+
 function toggleUserBan(userId: number) {
   const user = getUserById(userId);
   if (!user) return null;
@@ -1053,21 +1106,7 @@ async function renderDrawMenu(ctx: Ctx) {
   };
 
   if (ctx.updateType === "callback_query") {
-    if (typeof ctx.editMessageMedia === "function") {
-      const editedMedia = await ctx
-        .editMessageMedia(
-          {
-            type: "photo",
-            media: Input.fromLocalFile(DRAW_IMAGE_PATH),
-            caption: text,
-            parse_mode: "HTML",
-          },
-          { reply_markup: extra.reply_markup },
-        )
-        .then(() => true)
-        .catch(() => false);
-      if (editedMedia) return;
-    }
+    if (await editCachedPhotoMedia(ctx, DRAW_IMAGE_PATH, text, extra)) return;
 
     const editedCaption = typeof ctx.editMessageCaption === "function"
       ? await ctx.editMessageCaption(text, extra).then(() => true).catch(() => false)
@@ -1081,7 +1120,7 @@ async function renderDrawMenu(ctx: Ctx) {
   }
 
   try {
-    await ctx.replyWithPhoto(Input.fromLocalFile(DRAW_IMAGE_PATH), {
+    await replyWithCachedPhoto(ctx, DRAW_IMAGE_PATH, {
       ...extra,
       caption: text,
     });
@@ -1327,23 +1366,9 @@ async function renderOnlineWatchPrompt(ctx: Ctx) {
     reply_markup: onlineWatchMenuMarkup(),
   };
 
-  if (ctx.updateType === "callback_query" && typeof ctx.editMessageMedia === "function") {
-    const edited = await ctx
-      .editMessageMedia(
-        {
-          type: "photo",
-          media: Input.fromLocalFile(ONLINE_WATCH_IMAGE_PATH),
-          caption,
-          parse_mode: "HTML",
-        },
-        { reply_markup: extra.reply_markup },
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (edited) return;
-  }
+  if (await editCachedPhotoMedia(ctx, ONLINE_WATCH_IMAGE_PATH, caption, extra)) return;
 
-  await ctx.replyWithPhoto(Input.fromLocalFile(ONLINE_WATCH_IMAGE_PATH), {
+  await replyWithCachedPhoto(ctx, ONLINE_WATCH_IMAGE_PATH, {
     ...extra,
     caption,
   }).catch(() => null);
@@ -1353,13 +1378,13 @@ async function renderRentalsMenu(ctx: Ctx) {
   await renderRentalsList(ctx, ensureUser(ctx));
 }
 
-async function renderRentalsRules(ctx: Ctx) {
-  const availableAt = Date.now() + 30_000;
+async function renderRentalsRules(ctx: Ctx, options?: { instant?: boolean }) {
+  const availableAt = options?.instant ? Date.now() : Date.now() + 30_000;
   const text =
     `<b>🧾 Условия аренды аккаунта</b>\n\n` +
     `Перед входом в раздел подтвердите правила:\n\n` +
     `1. <b>Ежедневная активность:</b> минимум <b>10 игр Turbo</b> или <b>5 игр Rating</b> в день.\n` +
-    `2. <b>Ежедневный отчет:</b> каждый день в <b>20:00 МСК</b> нужно отправлять скрин списка игр.\n` +
+    `2. <b>Ежедневный отчет:</b> каждый день в <b>21:00 МСК</b> нужно отправлять скрин списка игр.\n` +
     `3. <b>Отчеты обязательны:</b> если отчет не будет отправлен <b>2 раза за 7 дней</b>, аренда аккаунта будет отменена.\n` +
     `4. <b>Игры нельзя портить:</b> запрещены ливы, руин и любые действия, которые снижают порядочность аккаунта. За серьезный вред аккаунту доступ к аренде блокируется навсегда.\n` +
     `5. <b>Steam-ссылки запрещены:</b> нельзя отправлять ссылки в Steam Chat. Общение и переходы в Steam Chat выполняются самостоятельно, без рассылки ссылок.`;
@@ -1367,7 +1392,7 @@ async function renderRentalsRules(ctx: Ctx) {
   await renderPhotoPrompt(ctx, WELCOME_IMAGE_PATH, text, {
     parse_mode: "HTML",
     reply_markup: Markup.inlineKeyboard([
-      [Markup.button.callback("✅ Я понял, открыть аренду", `rent:rules_accept:${availableAt}`)],
+      [Markup.button.callback(options?.instant ? "⬅️ Назад" : "✅ Я понял, открыть аренду", options?.instant ? "rent:list" : `rent:rules_accept:${availableAt}`)],
     ]).reply_markup,
   });
 }
@@ -1407,9 +1432,9 @@ function formatDiscordRentalCommand(rental: any) {
 function formatDiscordRentalInstruction(rental: any) {
   return (
     `<b>Заявка почти готова.</b>\n\n` +
-    `Чтобы подтвердить Discord, зайдите на сервер и отправьте команду в канале <code>1532708640513986562</code>:\n\n` +
+    `Чтобы подтвердить Discord, зайдите на сервер и отправьте команду в канале <b>rent-cmd</b> (<code>1532708640513986562</code>):\n\n` +
     `<code>${escapeHtml(formatDiscordRentalCommand(rental))}</code>\n\n` +
-    `После подтверждения заявка уйдет администраторам и помощникам уже с вашим Discord.`
+    `После подтверждения заявка уйдет на рассмотрение уже с вашим Discord.`
   );
 }
 
@@ -1439,6 +1464,20 @@ function moscowNowParts(date = new Date()) {
   };
 }
 
+function isAtOrAfterRentReportTime(moscow: { hour: number; minute: number }) {
+  return moscow.hour > RENT_REPORT_HOUR_MSK || (moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute >= RENT_REPORT_MINUTE_MSK);
+}
+
+function isRentalStartedAfterTodayReportTime(rental: any, dateKey: string) {
+  const rentedAt = String(rental?.rented_at || "").trim();
+  if (!rentedAt) return false;
+  const parsed = new Date(rentedAt);
+  if (Number.isNaN(parsed.getTime())) return false;
+  const rentedMoscow = moscowNowParts(parsed);
+  if (rentedMoscow.dateKey !== dateKey) return false;
+  return rentedMoscow.hour > RENT_REPORT_HOUR_MSK || (rentedMoscow.hour === RENT_REPORT_HOUR_MSK && rentedMoscow.minute > RENT_REPORT_MINUTE_MSK);
+}
+
 function activeRentalRows() {
   return (appState().rentals as any[]).filter((row) => Number(row.is_busy || 0) === 1 && Number(row.rented_by_user_id || 0));
 }
@@ -1447,6 +1486,25 @@ function rentReports() {
   const stateData = appState();
   if (!Array.isArray(stateData.rent_reports)) stateData.rent_reports = [];
   return stateData.rent_reports as any[];
+}
+
+function reportRequestDateKey(report: any) {
+  const explicitKey = String(report?.report_date || "").trim();
+  if (explicitKey) return explicitKey;
+  const requestedAt = String(report?.requested_at || "").trim();
+  if (!requestedAt) return "";
+  const parsed = new Date(requestedAt);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return moscowNowParts(parsed).dateKey;
+}
+
+function findDailyRentReport(rental: any, dateKey: string) {
+  return rentReports().find(
+    (report) =>
+      Number(report.rental_id || 0) === Number(rental.id || 0) &&
+      Number(report.user_id || 0) === Number(rental.rented_by_user_id || 0) &&
+      reportRequestDateKey(report) === dateKey,
+  ) || null;
 }
 
 function rentDiscordPendingRows() {
@@ -1487,8 +1545,873 @@ function createRentDiscordPending(rental: any, user: any) {
   return row;
 }
 
+function rentDiscordPendingFor(rentalNumber: number, userId: number) {
+  return rentDiscordPendingRows()
+    .filter((row) => Number(row.rental_number) === Number(rentalNumber) && Number(row.tg_user_id) === Number(userId))
+    .sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")))[0] || null;
+}
+
 function getRentReportById(reportId: number) {
   return rentReports().find((row) => Number(row.id) === Number(reportId)) || null;
+}
+
+function steamCookieHeaderFromRental(rental: any) {
+  const cookies = [
+    ["sessionid", rental?.steam_session_id],
+    ["steamLoginSecure", rental?.steam_login_secure],
+    ["browserid", rental?.steam_browser_id],
+  ]
+    .map(([name, value]) => [name, String(value || "").trim()])
+    .filter(([, value]) => value);
+  return cookies.map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+function parseSteamCookies(cookies: string[]) {
+  const parsed: Record<string, string> = {};
+  for (const cookie of cookies) {
+    const [pair] = String(cookie || "").split(";");
+    const separatorIndex = pair.indexOf("=");
+    if (separatorIndex <= 0) continue;
+    parsed[pair.slice(0, separatorIndex).trim()] = pair.slice(separatorIndex + 1).trim();
+  }
+  return parsed;
+}
+
+function steamCookieHeaderFromCookies(cookies: string[]) {
+  return Object.entries(parseSteamCookies(cookies))
+    .filter(([, value]) => value)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+}
+
+function decodeJwtPayload(token: string) {
+  const [, payload] = String(token || "").split(".");
+  if (!payload) return null;
+  try {
+    return JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function loadSteamMafileFromRental(rental: any) {
+  const mafilePath = String(rental?.mafile_path || rental?.mafile_archive_path || "").trim();
+  if (!mafilePath) return null;
+  try {
+    return JSON.parse(await fs.readFile(mafilePath, "utf8"));
+  } catch (error) {
+    console.warn(`[STEAM MAFILE READ FAILED] rental=${rental?.number || rental?.id || "unknown"} path=${mafilePath}`, error);
+    return null;
+  }
+}
+
+function steamRefreshTokenCandidates(rental: any, mafile: any) {
+  return Array.from(
+    new Set(
+      [
+        rental?.steam_refresh_token,
+        mafile?.Session?.RefreshToken,
+        mafile?.Session?.refresh_token,
+        mafile?.refresh_token,
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function steamTerminationKey(rental: any, mafile: any) {
+  const session = mafile?.Session || {};
+  return String(
+    session.SteamID ||
+      mafile?.steamid ||
+      mafile?.SteamID ||
+      mafile?.account_name ||
+      rental?.login ||
+      rental?.id ||
+      rental?.number ||
+      "unknown",
+  ).trim();
+}
+
+function steamCookiesFromMafile(mafile: any) {
+  const session = mafile?.Session || {};
+  const steamId = String(session.SteamID || mafile?.steamid || mafile?.SteamID || "").trim();
+  const accessToken = String(session.AccessToken || session.access_token || "").trim();
+  const mobileLoginSecure = steamId && accessToken && decodeJwtPayload(accessToken) ? `${steamId}%7C%7C${accessToken}` : "";
+  return [
+    ["sessionid", session.SessionID || session.sessionid],
+    ["steamLoginSecure", mobileLoginSecure || session.SteamLoginSecure || session.steamLoginSecure],
+    ["browserid", session.BrowserID || session.browserid],
+  ]
+    .map(([name, value]) => [name, String(value || "").trim()])
+    .filter(([, value]) => value)
+    .map(([name, value]) => `${name}=${value}`);
+}
+
+function tokenAudiences(token: string) {
+  const payload = decodeJwtPayload(token);
+  const aud = payload?.aud;
+  if (Array.isArray(aud)) return aud.map((value) => String(value));
+  if (aud) return [String(aud)];
+  return [];
+}
+
+function isExpectedSteamNetworkError(error: any) {
+  return error?.name === "AbortError" || error?.code === 429 || error?.cause?.code === "UND_ERR_CONNECT_TIMEOUT";
+}
+
+function steamTerminationCooldowns() {
+  const stateData = appState() as any;
+  if (!stateData.steam_termination_cooldowns || typeof stateData.steam_termination_cooldowns !== "object") {
+    stateData.steam_termination_cooldowns = {};
+  }
+  return stateData.steam_termination_cooldowns as Record<string, number>;
+}
+
+function getSteamTerminationCooldown(terminationKey: string) {
+  return Math.max(Number(steamTerminationCooldownUntil.get(terminationKey) || 0), Number(steamTerminationCooldowns()[terminationKey] || 0));
+}
+
+function setSteamTerminationCooldown(terminationKey: string, durationMs: number) {
+  const until = Date.now() + durationMs;
+  steamTerminationCooldownUntil.set(terminationKey, until);
+  steamTerminationCooldowns()[terminationKey] = until;
+  saveState();
+}
+
+function normalizeSteamProxyUrl(value: string) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed || /^off$/i.test(trimmed) || /^clear$/i.test(trimmed) || /^none$/i.test(trimmed)) return "";
+  const normalized = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `socks5://${trimmed}`;
+  const parsed = new URL(normalized);
+  if (!["socks4:", "socks4a:", "socks5:", "http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Unsupported proxy protocol");
+  }
+  if (!parsed.hostname || !parsed.port) throw new Error("Proxy host and port are required");
+  return parsed.toString();
+}
+
+function steamProxyUrl() {
+  if (steamProxyOverrideUrl !== null) {
+    steamProxyLastUrl = steamProxyOverrideUrl;
+    return steamProxyOverrideUrl;
+  }
+  const stateData = appState() as any;
+  const proxies = steamProxyList();
+  const now = Date.now();
+  for (const [proxy, failedUntil] of Array.from(steamProxyFailureUntil.entries())) {
+    if (failedUntil <= now) steamProxyFailureUntil.delete(proxy);
+  }
+  if (proxies.length) {
+    const active = proxies
+      .map((proxy) => String(proxy.url || "").trim())
+      .filter((proxy) => proxy && (steamProxyFailureUntil.get(proxy) || 0) <= now);
+    const picked = active.length ? active[Math.floor(Math.random() * active.length)] : "";
+    steamProxyLastUrl = picked;
+    return picked;
+  }
+  const picked = String(stateData.steam_session_proxy || "").trim();
+  steamProxyLastUrl = (steamProxyFailureUntil.get(picked) || 0) > now ? "" : picked;
+  return steamProxyLastUrl;
+}
+
+function activeSteamProxyUrls() {
+  const now = Date.now();
+  for (const [proxy, failedUntil] of Array.from(steamProxyFailureUntil.entries())) {
+    if (failedUntil <= now) steamProxyFailureUntil.delete(proxy);
+  }
+  const urls = steamProxyList()
+    .map((proxy) => String(proxy.url || "").trim())
+    .filter((proxy) => proxy && (steamProxyFailureUntil.get(proxy) || 0) <= now);
+  for (let index = urls.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [urls[index], urls[swapIndex]] = [urls[swapIndex], urls[index]];
+  }
+  return urls;
+}
+
+function steamProxyStatusText() {
+  const proxies = steamProxyList();
+  if (proxies.length) return `\u0441\u043b\u0443\u0447\u0430\u0439\u043d\u044b\u0439 \u0438\u0437 ${proxies.length}`;
+  return steamProxyUrl() ? maskedProxyUrl() : "\u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d";
+}
+
+function setSteamProxyUrl(value: string) {
+  (appState() as any).steam_session_proxy = value || null;
+  steamTerminationCooldownUntil.clear();
+  const cooldowns = steamTerminationCooldowns();
+  for (const key of Object.keys(cooldowns)) delete cooldowns[key];
+  saveState();
+}
+
+function steamProxyList() {
+  const stateData = appState() as any;
+  if (!Array.isArray(stateData.steam_session_proxies)) stateData.steam_session_proxies = [];
+  return stateData.steam_session_proxies as Array<{ id: number; url: string; created_at: string }>;
+}
+
+function addSteamProxyUrl(url: string) {
+  const proxies = steamProxyList();
+  const existing = proxies.find((proxy) => proxy.url === url);
+  if (existing) {
+    setSteamProxyUrl(existing.url);
+    return existing;
+  }
+  const row = { id: nextRowId(proxies), url, created_at: nowIso() };
+  proxies.push(row);
+  setSteamProxyUrl(row.url);
+  return row;
+}
+
+function deleteSteamProxy(proxyId: number) {
+  const stateData = appState() as any;
+  const proxies = steamProxyList();
+  const before = proxies.length;
+  stateData.steam_session_proxies = proxies.filter((row) => Number(row.id) !== Number(proxyId));
+  if (before === stateData.steam_session_proxies.length) return false;
+  stateData.steam_session_proxy = stateData.steam_session_proxies[0]?.url || null;
+  setSteamProxyUrl(String(stateData.steam_session_proxy || ""));
+  return true;
+}
+
+function clearSteamProxies() {
+  const stateData = appState() as any;
+  stateData.steam_session_proxies = [];
+  stateData.steam_session_proxy_active_id = null;
+  setSteamProxyUrl("");
+}
+
+function maskedProxyUrl() {
+  return maskedProxyValue(steamProxyUrl());
+}
+
+function maskedProxyValue(proxy: string) {
+  if (!proxy) return "disabled";
+  try {
+    const parsed = new URL(proxy);
+    if (parsed.password) parsed.password = "***";
+    if (parsed.username) parsed.username = parsed.username ? `${parsed.username}` : "";
+    return parsed.toString();
+  } catch {
+    return proxy.replace(/:\/\/([^:@]+):([^@]+)@/, "://$1:***@");
+  }
+}
+
+function isSteamProxyError(error: any) {
+  const text = `${String(error?.message || "")} ${String(error?.code || "")} ${String(error?.name || "")} ${String(error?.cause?.code || "")}`;
+  return /SOCKS|ERR_SOCKS|NotAllowed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|ENOTFOUND|EHOSTUNREACH/i.test(text);
+}
+
+function markSteamProxyFailure(error: any) {
+  if (!steamProxyLastUrl || !isSteamProxyError(error)) return false;
+  steamProxyFailureUntil.set(steamProxyLastUrl, Date.now() + 5 * 60 * 1000);
+  console.warn(`[STEAM PROXY QUARANTINED] proxy=${maskedProxyValue(steamProxyLastUrl)} ttl=300s reason=${String(error?.message || error)}`);
+  steamProxyLastUrl = "";
+  return true;
+}
+
+async function withSteamProxyOverride<T>(proxyUrl: string, fn: () => Promise<T>) {
+  const previous = steamProxyOverrideUrl;
+  steamProxyOverrideUrl = proxyUrl;
+  try {
+    return await fn();
+  } finally {
+    steamProxyOverrideUrl = previous;
+  }
+}
+
+async function runSteamProxySequence<T>(rental: any, label: string, fn: () => Promise<T>) {
+  const attempts = [...activeSteamProxyUrls(), ""];
+  let lastError: any = null;
+  for (const proxyUrl of attempts) {
+    try {
+      return await withSteamProxyOverride(proxyUrl, fn);
+    } catch (error) {
+      lastError = error;
+      if (proxyUrl && isSteamProxyError(error)) {
+        steamProxyFailureUntil.set(proxyUrl, Date.now() + 5 * 60 * 1000);
+        console.warn(`[STEAM PROXY QUARANTINED] proxy=${maskedProxyValue(proxyUrl)} ttl=300s reason=${String((error as any)?.message || error)}`);
+      }
+      console.warn(`[${label}${proxyUrl ? "" : " DIRECT"} FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+    }
+  }
+  if (lastError) throw lastError;
+  return null as T;
+}
+
+function steamSessionOptions() {
+  const proxy = steamProxyUrl();
+  if (!proxy) return {};
+  return proxy.startsWith("socks") ? { socksProxy: proxy } : { httpProxy: proxy };
+}
+
+function steamUserOptions() {
+  const proxy = steamProxyUrl();
+  return proxy ? { renewRefreshTokens: false, ...(proxy.startsWith("socks") ? { socksProxy: proxy } : { httpProxy: proxy }) } : { renewRefreshTokens: false };
+}
+
+function playwrightProxyOptions() {
+  const proxy = steamProxyUrl();
+  return proxy ? { proxy: { server: proxy } } : {};
+}
+
+async function getSteamClientSessionFromRefreshToken(refreshToken: string) {
+  if (!tokenAudiences(refreshToken).includes("client")) {
+    return { cookies: [], sessionId: null, kickedPlayingSession: false };
+  }
+
+  const SteamUser = require("steam-user");
+  const client = new SteamUser(steamUserOptions());
+  let settled = false;
+
+  return new Promise<{ cookies: string[]; sessionId: string | null; kickedPlayingSession: boolean }>((resolve) => {
+    let webSessionRequested = false;
+    let kickedPlayingSession = false;
+
+    const finish = (value: { cookies: string[]; sessionId: string | null; kickedPlayingSession: boolean }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      client.logOff();
+      resolve(value);
+    };
+    const timeout = setTimeout(() => finish({ cookies: [], sessionId: null, kickedPlayingSession }), 45_000);
+
+    client.once("loggedOn", () => {
+      webSessionRequested = true;
+      client.kickPlayingSession((error: Error | null) => {
+        kickedPlayingSession = !error;
+      });
+      client.webLogOn();
+    });
+    client.once("webSession", (sessionId: string, cookies: string[]) => {
+      finish({ cookies, sessionId, kickedPlayingSession });
+    });
+    client.once("error", () => finish({ cookies: [], sessionId: null, kickedPlayingSession }));
+    client.once("disconnected", () => {
+      if (!settled && webSessionRequested) finish({ cookies: [], sessionId: null, kickedPlayingSession });
+    });
+    try {
+      client.logOn({ refreshToken, logonID: Math.floor(Math.random() * 0x7fffffff), machineName: "rent-session-terminator" });
+    } catch {
+      finish({ cookies: [], sessionId: null, kickedPlayingSession });
+    }
+  });
+}
+
+async function getSteamWebSessionWithCredentials(rental: any, mafile: any) {
+  const accountName = String(rental?.login || mafile?.account_name || mafile?.AccountName || "").trim();
+  const password = String(rental?.pass || rental?.password || "").trim();
+  const steamGuardCode = await generateSteamGuardCodeFromRentalAtSteamTime(rental);
+  if (!accountName || !password || !steamGuardCode) return null;
+
+  const session = new LoginSession(EAuthTokenPlatformType.MobileApp, steamSessionOptions());
+  session.loginTimeout = 12_000;
+  try {
+    const authenticated = new Promise<{ ok: boolean; error?: Error }>((resolve) => {
+      const timeout = setTimeout(() => resolve({ ok: false, error: new Error("Steam web login timed out") }), 15_000);
+      const finish = (result: { ok: boolean; error?: Error }) => {
+        clearTimeout(timeout);
+        resolve(result);
+      };
+      session.once("authenticated", () => finish({ ok: true }));
+      session.once("timeout", () => finish({ ok: false, error: new Error("Steam web login timed out") }));
+      session.once("error", (error: Error) => finish({ ok: false, error }));
+    });
+
+    const response = await session.startWithCredentials({
+      accountName,
+      password,
+      steamGuardCode,
+    });
+    if (response.actionRequired) {
+      const needsDeviceCode = response.validActions?.some((action: any) => action.type === EAuthSessionGuardType.DeviceCode);
+      if (needsDeviceCode) await session.submitSteamGuardCode(steamGuardCode);
+    }
+
+    const authResult = await authenticated;
+    if (!authResult.ok) throw authResult.error || new Error("Steam web login failed");
+    const cookies = await session.getWebCookies();
+    const accessToken = String(session.accessToken || "").trim();
+    const refreshToken = String(session.refreshToken || "").trim();
+    session.cancelLoginAttempt?.();
+    return { cookies, accessToken, refreshToken };
+  } catch (error) {
+    session.cancelLoginAttempt?.();
+    throw error;
+  }
+}
+
+async function postSteamForm(url: string, cookieHeader: string, body: URLSearchParams) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      cookie: cookieHeader,
+      origin: new URL(url).origin,
+      referer: "https://store.steampowered.com/twofactor/manage",
+      "user-agent": "Mozilla/5.0",
+    },
+    body,
+  });
+  if (response.status === 302) return true;
+  if (!response.ok || response.url.includes("/login/")) return false;
+  const text = await response.text().catch(() => "");
+  if (/login\/\?redir|Sign in|Войти/i.test(text)) return false;
+  return true;
+}
+
+async function deauthorizeSteamDevicesWithApi(cookieHeader: string, sessionId: string) {
+  if (!cookieHeader || !sessionId) return false;
+  const bodies = [
+    new URLSearchParams({ sessionid: sessionId, action: "deauthorize" }),
+    new URLSearchParams({ sessionid: sessionId, action: "deauthorize_all_devices" }),
+  ];
+  const results = await Promise.allSettled([
+    postSteamForm("https://store.steampowered.com/twofactor/manage_action", cookieHeader, bodies[0]),
+    postSteamForm("https://store.steampowered.com/account/authorizeddevices", cookieHeader, bodies[0]),
+    postSteamForm("https://store.steampowered.com/account/authorizeddevices", cookieHeader, bodies[1]),
+  ]);
+  return results.some((result) => result.status === "fulfilled" && result.value);
+}
+
+async function postSteamApi(method: string, accessToken: string, payload: Record<string, any>) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  const body = new URLSearchParams({
+    access_token: accessToken,
+    input_json: JSON.stringify(payload),
+  });
+  try {
+    const response = await fetch(`https://api.steampowered.com/IAuthenticationService/${method}/v1/`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "user-agent": "Mozilla/5.0",
+      },
+      body,
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const text = await response.text();
+    if (!text.trim()) return {};
+    try {
+      return JSON.parse(text)?.response || {};
+    } catch {
+      return {};
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function revokeSteamTokenString(token: string, accessToken: string) {
+  const result = await postSteamApi("RevokeToken", accessToken, {
+    token,
+    revoke_action: 1,
+  });
+  return !!result;
+}
+
+async function revokeSteamRefreshTokenIds(accessToken: string) {
+  const enumerated = await postSteamApi("EnumerateTokens", accessToken, { include_revoked: false });
+  const tokens = Array.isArray(enumerated?.refresh_tokens) ? enumerated.refresh_tokens : [];
+  let revokedCount = 0;
+  for (const token of tokens) {
+    const tokenId = String(token?.token_id || "").trim();
+    if (!tokenId) continue;
+    const result = await postSteamApi("RevokeRefreshToken", accessToken, {
+      token_id: tokenId,
+      revoke_action: 1,
+    });
+    if (result) revokedCount += 1;
+  }
+  return revokedCount;
+}
+
+async function firstVisibleLocator(page: any, selectors: string[], timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      if ((await locator.count().catch(() => 0)) > 0 && (await locator.isVisible().catch(() => false))) {
+        return locator;
+      }
+    }
+    await page.waitForTimeout(250).catch(() => null);
+  }
+  return null;
+}
+
+async function fillFirstVisible(page: any, selectors: string[], value: string, timeoutMs = 10_000) {
+  const locator = await firstVisibleLocator(page, selectors, timeoutMs);
+  if (!locator) return false;
+  await locator.fill(value);
+  return true;
+}
+
+async function clickFirstVisible(page: any, selectors: string[], timeoutMs = 10_000) {
+  const locator = await firstVisibleLocator(page, selectors, timeoutMs);
+  if (!locator) return false;
+  await locator.click();
+  return true;
+}
+
+async function clickSteamActionByText(page: any, labels: string[], timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const clicked = await page
+      .evaluate((candidateLabels: string[]) => {
+        const normalizedLabels = candidateLabels.map((label) => label.toLowerCase());
+        const isClickable = (element: Element) => {
+          const tag = element.tagName.toLowerCase();
+          const role = element.getAttribute("role") || "";
+          const className = String((element as HTMLElement).className || "");
+          return (
+            ["button", "a", "input"].includes(tag) ||
+            role === "button" ||
+            typeof (element as HTMLElement).onclick === "function" ||
+            /\b(btn|button|DialogButton|action|remove|deauth)\b/i.test(className)
+          );
+        };
+        const visibleMatches = Array.from(document.querySelectorAll("body *"))
+          .map((element) => {
+            const htmlElement = element as HTMLElement;
+            const text = `${htmlElement.innerText || htmlElement.textContent || ""} ${(htmlElement as HTMLInputElement).value || ""}`.trim();
+            const rect = htmlElement.getBoundingClientRect();
+            const visible = rect.width > 20 && rect.height > 12 && rect.bottom > 0 && rect.top < window.innerHeight;
+            const matches = normalizedLabels.some((label) => text.toLowerCase().includes(label));
+            return { element: htmlElement, rect, visible, matches, text };
+          })
+          .filter((item) => item.visible && item.matches)
+          .map((item) => {
+            let target: HTMLElement | null = item.element;
+            for (let depth = 0; target && depth < 5; depth += 1) {
+              if (isClickable(target)) break;
+              target = target.parentElement;
+            }
+            return target ? { target, rect: target.getBoundingClientRect() } : null;
+          })
+          .filter(Boolean) as Array<{ target: HTMLElement; rect: DOMRect }>;
+        visibleMatches.sort((left, right) => right.rect.top - left.rect.top || right.rect.width * right.rect.height - left.rect.width * left.rect.height);
+        const target = visibleMatches[0]?.target;
+        if (!target) return false;
+        target.scrollIntoView({ block: "center", inline: "center" });
+        target.click();
+        return true;
+      }, labels)
+      .catch(() => false);
+    if (clicked) return true;
+    await page.mouse.wheel(0, 1200).catch(() => null);
+    await page.waitForTimeout(300).catch(() => null);
+  }
+  return false;
+}
+
+async function submitSteamAuthorizedDevicesForm(page: any) {
+  const actionResult = await page
+    .evaluate(() => {
+      const forms = Array.from(document.querySelectorAll("form"));
+      const form = forms.find((item) => /deauthorize|authorizeddevices|steamguard/i.test(item.getAttribute("action") || ""));
+      if (!form) return null;
+      const action = form.getAttribute("action") || window.location.href;
+      const data = new FormData(form);
+      const submitter = Array.from(form.querySelectorAll("button,input")).find((element) =>
+        /sign out|deauthorize|выйти|деавтор/i.test(`${element.textContent || ""} ${(element as HTMLInputElement).value || ""}`),
+      ) as HTMLButtonElement | HTMLInputElement | undefined;
+      if (submitter?.name) data.set(submitter.name, submitter.value || "1");
+      return {
+        action: new URL(action, window.location.href).href,
+        method: (form.getAttribute("method") || "POST").toUpperCase(),
+        body: new URLSearchParams(Array.from(data.entries()).map(([key, value]) => [key, String(value)])).toString(),
+      };
+    })
+    .catch(() => null);
+  if (!actionResult?.action) return false;
+  const response = await page.request.fetch(actionResult.action, {
+    method: actionResult.method,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      origin: "https://store.steampowered.com",
+      referer: "https://store.steampowered.com/account/authorizeddevices",
+    },
+    data: actionResult.body,
+  });
+  return response.ok() || response.status() === 302;
+}
+
+async function clickSteamSignOutEverywhere(page: any) {
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => null);
+  await page.waitForTimeout(700).catch(() => null);
+  const labels = ["Sign out everywhere", "Deauthorize all devices", "Deauthorize all other devices", "Выйти везде", "Деавторизовать все устройства"];
+  const clicked = await clickSteamActionByText(page, labels, 18_000);
+  if (!clicked) return submitSteamAuthorizedDevicesForm(page);
+
+  await page.waitForTimeout(900).catch(() => null);
+  await clickSteamActionByText(page, ["Confirm", "OK", "Continue", "Sign out everywhere", "Подтвердить", "ОК", "Продолжить", "Выйти везде"], 7000).catch(
+    () => false,
+  );
+  await page.waitForTimeout(2500).catch(() => null);
+  return true;
+}
+
+async function submitSteamGuardCode(page: any, guardCode: string) {
+  const code = String(guardCode || "").trim();
+  if (!code) return false;
+
+  await page.waitForTimeout(1200).catch(() => null);
+  const oneCharInputs = page.locator('input[maxlength="1"], input[data-index]');
+  const oneCharCount = await oneCharInputs.count().catch(() => 0);
+  if (oneCharCount >= 5) {
+    for (let index = 0; index < 5; index += 1) {
+      await oneCharInputs.nth(index).fill(code[index] || "");
+    }
+    return true;
+  }
+
+  return fillFirstVisible(
+    page,
+    [
+      'input[inputmode="numeric"]',
+      'input[autocomplete="one-time-code"]',
+      'input[type="tel"]',
+      'input[type="text"]:not([name="username"])',
+    ],
+    code,
+    2500,
+  );
+}
+
+async function deauthorizeSteamDevicesWithBrowser(rental: any) {
+  const login = String(rental?.login || "").trim();
+  const password = String(rental?.pass || rental?.password || "").trim();
+  if (!login || !password) return false;
+
+  const guardCode = await generateSteamGuardCodeFromRental(rental);
+  const { chromium } = (await import("playwright")) as any;
+  const browser = await chromium.launch({ headless: true, ...playwrightProxyOptions() });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto("https://store.steampowered.com/login/?redir=account%2Fauthorizeddevices", {
+      waitUntil: "domcontentloaded",
+      timeout: 35_000,
+    });
+
+    const filledLogin = await fillFirstVisible(
+      page,
+      ['input[name="username"]', 'input[type="text"]', 'input[autocomplete="username"]'],
+      login,
+      15_000,
+    );
+    const filledPassword = await fillFirstVisible(
+      page,
+      ['input[name="password"]', 'input[type="password"]', 'input[autocomplete="current-password"]'],
+      password,
+      15_000,
+    );
+    if (!filledLogin || !filledPassword) return false;
+
+    const clickedLogin = await clickFirstVisible(
+      page,
+      ['button[type="submit"]', 'button:has-text("Sign in")', 'button:has-text("Войти")'],
+      10_000,
+    );
+    if (!clickedLogin) return false;
+
+    if (guardCode) {
+      await submitSteamGuardCode(page, guardCode);
+      await clickFirstVisible(page, ['button:has-text("Submit")', 'button:has-text("Continue")', 'button:has-text("Отправить")'], 2500).catch(
+        () => false,
+      );
+    }
+
+    await page.waitForURL((url: URL) => !url.pathname.includes("/login"), { timeout: 35_000 }).catch(() => null);
+    await page.goto("https://store.steampowered.com/account/authorizeddevices", {
+      waitUntil: "domcontentloaded",
+      timeout: 35_000,
+    });
+    return clickSteamSignOutEverywhere(page);
+  } finally {
+    await context.close().catch(() => null);
+    await browser.close().catch(() => null);
+  }
+}
+
+async function deauthorizeSteamDevicesWithCookies(cookies: string[]) {
+  const parsedCookies = parseSteamCookies(cookies);
+  const steamLoginSecure = parsedCookies.steamLoginSecure;
+  const sessionId = parsedCookies.sessionid;
+  if (!steamLoginSecure || !sessionId) return false;
+
+  const { chromium } = (await import("playwright")) as any;
+  const browser = await chromium.launch({ headless: true, ...playwrightProxyOptions() });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  });
+  const page = await context.newPage();
+
+  try {
+    await context.addCookies(
+      Object.entries(parsedCookies).map(([name, value]) => ({
+        name,
+        value,
+        domain: ".steampowered.com",
+        path: "/",
+        httpOnly: name.toLowerCase().includes("secure"),
+        secure: true,
+        sameSite: "Lax" as const,
+      })),
+    );
+    await page.goto("https://store.steampowered.com/account/authorizeddevices", {
+      waitUntil: "domcontentloaded",
+      timeout: 35_000,
+    });
+    return clickSteamSignOutEverywhere(page);
+  } finally {
+    await context.close().catch(() => null);
+    await browser.close().catch(() => null);
+  }
+}
+
+async function terminateSteamSessionsForRental(rental: any) {
+  const mafile = await loadSteamMafileFromRental(rental);
+  const terminationKey = steamTerminationKey(rental, mafile);
+  const runningTermination = steamTerminationInFlight.get(terminationKey);
+  if (runningTermination) {
+    return runningTermination;
+  }
+  const termination = terminateSteamSessionsForRentalOnce(rental, mafile, terminationKey).finally(() => {
+    steamTerminationInFlight.delete(terminationKey);
+  });
+  steamTerminationInFlight.set(terminationKey, termination);
+  return termination;
+}
+
+async function terminateSteamSessionsForRentalOnce(rental: any, mafile: any, terminationKey: string) {
+  const refreshTokens = steamRefreshTokenCandidates(rental, mafile);
+  const mafileAccessToken = String(mafile?.Session?.AccessToken || mafile?.Session?.access_token || "").trim();
+  const mafileCookies = steamCookiesFromMafile(mafile);
+  let sessionId = String(rental?.steam_session_id || "").trim();
+  let cookieHeader = steamCookieHeaderFromRental(rental);
+  let terminated = false;
+  const accessTokens = new Set<string>(
+    [mafileAccessToken, rental?.steam_login_secure]
+      .map((token) => String(token || "").trim())
+      .filter((token) => token && decodeJwtPayload(token)),
+  );
+
+  if (mafileCookies.length) {
+    const parsedCookies = parseSteamCookies(mafileCookies);
+    if (parsedCookies.sessionid) sessionId = parsedCookies.sessionid;
+    const mafileCookieHeader = steamCookieHeaderFromCookies(mafileCookies);
+    if (mafileCookieHeader) cookieHeader = mafileCookieHeader;
+    try {
+      terminated = (await deauthorizeSteamDevicesWithApi(cookieHeader, sessionId)) || terminated;
+      if (!terminated) {
+        terminated = (await runSteamProxySequence(rental, "STEAM MAFILE COOKIE SESSION", () => deauthorizeSteamDevicesWithCookies(mafileCookies))) || terminated;
+      }
+    } catch (error) {
+      console.warn(`[STEAM MAFILE COOKIE SESSION FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+    }
+  }
+
+  if (!terminated && getSteamTerminationCooldown(terminationKey) <= Date.now()) {
+    try {
+      const freshSession = await runSteamProxySequence(rental, "STEAM FRESH WEB LOGIN", () => getSteamWebSessionWithCredentials(rental, mafile));
+      if (freshSession?.accessToken && decodeJwtPayload(freshSession.accessToken)) accessTokens.add(freshSession.accessToken);
+      if (freshSession?.refreshToken && decodeJwtPayload(freshSession.refreshToken)) {
+        refreshTokens.push(freshSession.refreshToken);
+        if (tokenAudiences(freshSession.refreshToken).includes("client") && getSteamTerminationCooldown(`${terminationKey}:cm`) <= Date.now()) {
+          const clientSession = await getSteamClientSessionFromRefreshToken(freshSession.refreshToken);
+          terminated = clientSession.kickedPlayingSession || terminated;
+          setSteamTerminationCooldown(`${terminationKey}:cm`, 90_000);
+        }
+      }
+      if (freshSession?.cookies?.length) {
+        const parsedCookies = parseSteamCookies(freshSession.cookies);
+        if (parsedCookies.sessionid) sessionId = parsedCookies.sessionid;
+        const freshCookieHeader = steamCookieHeaderFromCookies(freshSession.cookies);
+        if (freshCookieHeader) cookieHeader = freshCookieHeader;
+        terminated = (await deauthorizeSteamDevicesWithApi(cookieHeader, sessionId)) || terminated;
+      }
+    } catch (error) {
+      if ((error as any)?.code === 429) {
+        setSteamTerminationCooldown(terminationKey, 10 * 60 * 1000);
+      } else {
+        console.warn(`[STEAM FRESH WEB LOGIN FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+      }
+    }
+  }
+
+  for (const refreshToken of refreshTokens) {
+    if (!tokenAudiences(refreshToken).includes("client")) continue;
+    try {
+      const { cookies, sessionId: steamClientSessionId, kickedPlayingSession } = await getSteamClientSessionFromRefreshToken(refreshToken);
+      terminated = kickedPlayingSession || terminated;
+      const parsedCookies = parseSteamCookies(cookies);
+      if (steamClientSessionId || parsedCookies.sessionid) sessionId = steamClientSessionId || parsedCookies.sessionid;
+      const freshCookieHeader = steamCookieHeaderFromCookies(cookies);
+      if (freshCookieHeader) cookieHeader = freshCookieHeader;
+      if (cookies.length) terminated = (await deauthorizeSteamDevicesWithApi(cookieHeader, sessionId)) || terminated;
+      break;
+    } catch (error) {
+      markSteamProxyFailure(error);
+      console.warn(`[STEAM CLIENT SESSION FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+    }
+  }
+
+  for (const accessToken of Array.from(accessTokens)) {
+    try {
+      const revokedTokenIds = await revokeSteamRefreshTokenIds(accessToken);
+      if (revokedTokenIds > 0) terminated = true;
+    } catch (error) {
+      if (!isExpectedSteamNetworkError(error)) console.warn(`[STEAM TOKEN ENUMERATE FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+    }
+  }
+  for (const refreshToken of refreshTokens) {
+    for (const accessToken of Array.from(accessTokens)) {
+      try {
+        terminated = (await revokeSteamTokenString(refreshToken, accessToken)) || terminated;
+        break;
+      } catch (error) {
+        if (!isExpectedSteamNetworkError(error)) console.warn(`[STEAM TOKEN REVOKE FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+      }
+    }
+  }
+
+  if (sessionId && cookieHeader) {
+    const deauthorizeBody = new URLSearchParams({ sessionid: sessionId, action: "deauthorize" });
+    const logoutBody = new URLSearchParams({ sessionid: sessionId });
+    const results = await Promise.allSettled([
+      postSteamForm("https://store.steampowered.com/twofactor/manage_action", cookieHeader, deauthorizeBody),
+      postSteamForm("https://store.steampowered.com/login/logout/", cookieHeader, logoutBody),
+      postSteamForm("https://steamcommunity.com/login/logout/", cookieHeader, logoutBody),
+    ]);
+    terminated = results.some((result) => result.status === "fulfilled" && result.value);
+  }
+
+  if (!terminated) {
+    try {
+      terminated = await runSteamProxySequence(rental, "STEAM BROWSER SESSION", () => deauthorizeSteamDevicesWithBrowser(rental));
+    } catch (error) {
+      console.warn(`[STEAM BROWSER SESSION FAILED] rental=${rental?.number || rental?.id || "unknown"}`, error);
+    }
+  }
+  if (!terminated) {
+    console.warn(`[STEAM SESSION TERMINATE SKIPPED] rental=${rental?.number || rental?.id || "unknown"}`);
+  } else {
+    setSteamTerminationCooldown(terminationKey, 90_000);
+  }
+  return terminated;
 }
 
 function cancelRental(rental: any) {
@@ -1500,11 +2423,26 @@ function cancelRental(rental: any) {
   rental.last_report_date = null;
   rental.last_report_message_id = null;
   rental.report_misses = [];
+  rental.steam_refresh_token = null;
+  rental.steam_login_secure = null;
+  rental.steam_login_secure_exp = null;
+  rental.steam_session_id = null;
+  rental.steam_browser_id = null;
   appState().guard_attempts = (appState().guard_attempts as any[]).filter(
     (row) => Number(row.rental_id) !== Number(rental.id) || Number(row.user_id) !== renterId,
   );
   saveState();
   return true;
+}
+
+async function cancelRentalWithSteamSessions(rental: any) {
+  if (!rental) return false;
+  const rentalId = Number(rental.id || 0);
+  const liveRental = rentalId ? getRentalById(rentalId) || rental : rental;
+  const steamCleanupRental = { ...liveRental };
+  const canceled = cancelRental(liveRental);
+  terminateSteamSessionsForRental(steamCleanupRental).catch((error) => console.error("[STEAM SESSION TERMINATE ERROR]", error));
+  return canceled;
 }
 
 function markRentalReportMiss(rental: any) {
@@ -1519,20 +2457,26 @@ function markRentalReportMiss(rental: any) {
   return rental.report_misses.length;
 }
 
-async function notifyRentalCanceled(ctx: Ctx, rental: any, reason: string) {
-  const renter = getUserById(Number(rental?.rented_by_user_id || 0));
-  cancelRental(rental);
-  if (renter?.tg_id) {
-    await ctx.telegram.sendMessage(
-      Number(renter.tg_id),
-      `<b>Аренда аккаунта №${rental.number} отменена.</b>\n${escapeHtml(reason)}`,
-      { parse_mode: "HTML" },
-    ).catch(() => null);
-  }
-}
-
 function rentalBackButton() {
   return Markup.button.callback("⬅️ Назад", "rent:list");
+}
+
+function activeReportMissCount(rental: any) {
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  return (Array.isArray(rental.report_misses) ? rental.report_misses : [])
+    .map((value: any) => Date.parse(String(value)))
+    .filter((value: number) => Number.isFinite(value) && value >= weekAgo).length;
+}
+
+function rentalDiscordLabel(rental: any, renter: any) {
+  const userDiscord = String(renter?.discord_tag || renter?.discord_id || "").trim();
+  if (userDiscord) return userDiscord;
+  const latest = rentDiscordPendingRows()
+    .filter((row) => Number(row.rental_number) === Number(rental.number) && Number(row.tg_user_id) === Number(renter?.id || 0))
+    .sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")))[0];
+  const name = String(latest?.discord_display_name || latest?.discord_username || "").trim();
+  const id = String(latest?.discord_user_id || "").trim();
+  return name && id ? `${name} (${id})` : name || id || "-";
 }
 
 async function renderRentalsList(ctx: Ctx, user: any) {
@@ -1540,6 +2484,7 @@ async function renderRentalsList(ctx: Ctx, user: any) {
   const keyboardRows = rows.map((row) => [
     Markup.button.callback(rentalListLabel(row), `rent:view:${row.number}`),
   ]);
+  keyboardRows.push([Markup.button.callback("📜 Правила", "rent:rules")]);
   if (canManageRentals(user)) {
     keyboardRows.push([Markup.button.callback("⚙️ Управление", "rent:manage")]);
   }
@@ -1565,17 +2510,22 @@ async function renderRentalCard(ctx: Ctx, number: number) {
   }
   const busyText = Number(rental.is_busy || 0) ? "\n\n<b>Статус:</b> занят" : "";
   const renter = getUserById(Number(rental.rented_by_user_id || 0));
-  const renterText = `\n<b>Арендован:</b> ${escapeHtml(userLabel(renter))}`;
+  const managerDetails = canManageRentals(ensureUser(ctx)) && renter
+    ? `\n<b>Арендован:</b> ${escapeHtml(userLabel(renter))}\n<b>Discord:</b> ${escapeHtml(rentalDiscordLabel(rental, renter))}\n<b>Отчетов пропущено:</b> ${activeReportMissCount(rental)}`
+    : "";
+  const keyboardRows = Number(rental.is_busy || 0)
+    ? [[rentalBackButton()]]
+    : [
+        [Markup.button.callback("🧾 Арендовать", `rent:take:${rental.number}`)],
+        [rentalBackButton()],
+      ];
   await replaceOrReply(
     ctx,
-    `<b>${escapeHtml(String(rental.title || `Аккаунт #${rental.number}`))} №${rental.number}</b>\n\n${escapeHtml(String(rental.description || "Описание не указано."))}${canManageRentals(ensureUser(ctx)) ? renterText : ""}${busyText}`,
+    `<b>${escapeHtml(String(rental.title || `Аккаунт #${rental.number}`))} №${rental.number}</b>\n\n${escapeHtml(String(rental.description || "Описание не указано."))}${managerDetails}${busyText}`,
     {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback("🧾 Арендовать", `rent:take:${rental.number}`)],
-        [rentalBackButton()],
-      ]).reply_markup,
+      reply_markup: Markup.inlineKeyboard(keyboardRows).reply_markup,
     },
   );
 }
@@ -1603,7 +2553,7 @@ async function renderRentalsCancelMenu(ctx: Ctx) {
   const keyboardRows = rows.map((row) => [
     Markup.button.callback(
       `Отменить: ${String(row.title || `Аккаунт #${row.number}`)} №${row.number}`,
-      `rent:cancel:${row.number}`,
+      `rent:cancel:${row.id}`,
     ),
   ]);
   keyboardRows.push([Markup.button.callback("⬅️ Назад", "rent:manage")]);
@@ -1725,17 +2675,24 @@ async function saveTelegramDocument(ctx: Ctx, document: any) {
 
 function managersForRentals() {
   const roleRows = appState().user_roles as any[];
-  const userIds = new Set(
-    roleRows
-      .filter((row) => row.role === "HELPER" || row.role === "ADMIN")
-      .map((row) => Number(row.user_id)),
-  );
+  const userIds = new Set<number>();
+  for (const row of roleRows) {
+    const role = normalizeRole(row.role);
+    if (role === "HELPER" || role === "ADMIN") userIds.add(Number(row.user_id));
+  }
   for (const user of appState().users as any[]) {
     if (ADMIN_IDS.includes(Number(user.tg_id || 0))) userIds.add(Number(user.id));
   }
-  return [...userIds]
+  const managers = [...userIds]
     .map((id) => getUserById(id))
     .filter((user) => user && Number(user.is_banned || 0) !== 1 && Number(user.tg_id || 0));
+  const seenTgIds = new Set<number>();
+  return managers.filter((user) => {
+    const tgId = Number(user.tg_id || 0);
+    if (!tgId || seenTgIds.has(tgId)) return false;
+    seenTgIds.add(tgId);
+    return true;
+  });
 }
 
 async function notifyRentalManagers(ctx: Ctx, rental: any, requester: any, discordUser?: any) {
@@ -1774,12 +2731,23 @@ async function notifyRentalManagers(ctx: Ctx, rental: any, requester: any, disco
 async function sendRentalReportReminder(rental: any) {
   const renter = getUserById(Number(rental.rented_by_user_id || 0));
   if (!renter?.tg_id) return false;
+  const reportDate = moscowNowParts().dateKey;
+  const existingReport = findDailyRentReport(rental, reportDate);
+  if (existingReport) {
+    rental.last_report_date = reportDate;
+    if (!rental.report_deadline_at && String(existingReport.deadline_at || "")) {
+      rental.report_deadline_at = existingReport.deadline_at;
+    }
+    saveState();
+    return false;
+  }
   const reports = rentReports();
   const report = {
     id: nextRowId(reports),
     rental_id: Number(rental.id),
     rental_number: Number(rental.number),
     user_id: Number(renter.id),
+    report_date: reportDate,
     status: "REQUESTED",
     requested_at: nowIso(),
     deadline_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
@@ -1792,7 +2760,7 @@ async function sendRentalReportReminder(rental: any) {
   };
   reports.push(report);
   rental.report_deadline_at = report.deadline_at;
-  rental.last_report_date = moscowNowParts().dateKey;
+  rental.last_report_date = reportDate;
   saveState();
 
   const text =
@@ -1847,7 +2815,7 @@ async function runRentReportTick() {
       rental.report_deadline_at = null;
       saveState();
       if (misses >= 2) {
-        cancelRental(rental);
+        await cancelRentalWithSteamSessions(rental);
         if (renter?.tg_id) {
           await bot.telegram.sendMessage(
             Number(renter.tg_id),
@@ -1864,7 +2832,12 @@ async function runRentReportTick() {
       }
       continue;
     }
-    if (moscow.hour === 20 && moscow.minute === 0 && String(rental.last_report_date || "") !== moscow.dateKey) {
+    if (
+      isAtOrAfterRentReportTime(moscow) &&
+      !isRentalStartedAfterTodayReportTime(rental, moscow.dateKey) &&
+      String(rental.last_report_date || "") !== moscow.dateKey &&
+      !findDailyRentReport(rental, moscow.dateKey)
+    ) {
       await sendRentalReportReminder(rental);
     }
   }
@@ -1885,6 +2858,9 @@ async function runRentDiscordBridgeTick(ctxLike?: Ctx) {
   }
   const rows = rentDiscordPendingRows().filter((row) => String(row.status || "") === "CONFIRMED" && !row.processed_at);
   for (const row of rows) {
+    row.status = "PROCESSING";
+    row.updated_at = nowIso();
+    saveState();
     const rental = getRentalByNumber(Number(row.rental_number || 0));
     const requester = getUserById(Number(row.tg_user_id || 0));
     if (!rental || !requester) {
@@ -1913,9 +2889,10 @@ async function runRentDiscordBridgeTick(ctxLike?: Ctx) {
     row.updated_at = nowIso();
     saveState();
     if (requester.tg_id) {
+      state.delete(Number(requester.tg_id));
       await bot.telegram.sendMessage(
         Number(requester.tg_id),
-        `<b>Discord подтвержден.</b>\nЗаявка по аккаунту №${rental.number} отправлена администраторам и помощникам.`,
+        `<b>Discord подтвержден.</b>\nЗаявка по аккаунту №${rental.number} отправлена на рассмотрение.`,
         { parse_mode: "HTML" },
       ).catch(() => null);
     }
@@ -1963,6 +2940,38 @@ async function generateSteamGuardCodeFromRental(rental: any) {
     const sharedSecret = String(parsed.shared_secret || parsed.SharedSecret || "").trim();
     if (!sharedSecret) return null;
     return steamGuardCodeFromSharedSecret(sharedSecret);
+  } catch {
+    return null;
+  }
+}
+
+async function querySteamServerTime() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch("https://api.steampowered.com/ITwoFactorService/QueryTime/v1/?steamid=0", {
+      headers: { "user-agent": "Mozilla/5.0" },
+      signal: controller.signal,
+    });
+    if (!response.ok) return Math.floor(Date.now() / 1000);
+    const parsed = await response.json().catch(() => null);
+    return Number(parsed?.response?.server_time || parsed?.server_time || Math.floor(Date.now() / 1000));
+  } catch {
+    return Math.floor(Date.now() / 1000);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateSteamGuardCodeFromRentalAtSteamTime(rental: any) {
+  const mafilePath = String(rental.mafile_path || rental.mafile_archive_path || "").trim();
+  if (!mafilePath) return null;
+  try {
+    const raw = await fs.readFile(mafilePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const sharedSecret = String(parsed.shared_secret || parsed.SharedSecret || "").trim();
+    if (!sharedSecret) return null;
+    return steamGuardCodeFromSharedSecret(sharedSecret, await querySteamServerTime());
   } catch {
     return null;
   }
@@ -3223,6 +4232,17 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (isRentalsBtn) {
+    await clearUserFlowOnly(ctx);
+    if (hasAcceptedRentRules(me.id)) {
+      await renderRentalsMenu(ctx);
+    } else {
+      await renderRentalsRules(ctx);
+    }
+    logEvent(me, "rentals", "open_menu");
+    return;
+  }
+
   const activeFlow = state.get(ctx.from.id);
   if (activeFlow?.mode === "admin_broadcast_input" && hasRole(me, ["ADMIN"])) {
     await sendAdminBroadcast(ctx, me);
@@ -3374,10 +4394,33 @@ bot.on("text", async (ctx) => {
   }
 
   if (activeFlow?.mode === "rent_discord_handoff") {
+    if (isDrawBtn || isOnlineBtn || isSettingsBtn || isRentalsBtn) {
+      state.delete(ctx.from.id);
+      if (isDrawBtn) {
+        await renderDrawMenu(ctx);
+        logEvent(me, "draw", "open_menu");
+        return;
+      }
+      if (isSettingsBtn) {
+        await renderSettingsMenu(ctx, me);
+        return;
+      }
+      if (isOnlineBtn) {
+        state.set(ctx.from.id, { mode: "online_watch_profile_input" });
+        await renderOnlineWatchPrompt(ctx);
+        return;
+      }
+    }
     const rental = getRentalByNumber(activeFlow.payload.rentalNumber);
     if (!rental) {
       state.delete(ctx.from.id);
       await ctx.reply("<b>Аккаунт не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const pending = rentDiscordPendingFor(Number(rental.number), Number(me.id));
+    if (pending && ["CONFIRMED", "PROCESSING", "SENT"].includes(String(pending.status || ""))) {
+      state.delete(ctx.from.id);
+      await runRentDiscordBridgeTick(ctx).catch((error) => console.error("[RENT DISCORD BRIDGE ERROR]", error));
       return;
     }
     await ctx.reply(formatDiscordRentalInstruction(rental), {
@@ -3444,16 +4487,6 @@ bot.on("text", async (ctx) => {
       logEvent(me, "draw", "open_menu");
       return;
     }
-    if (isRentalsBtn) {
-      await clearUserFlowOnly(ctx);
-      if (hasAcceptedRentRules(me.id)) {
-        await renderRentalsMenu(ctx);
-      } else {
-        await renderRentalsRules(ctx);
-      }
-      logEvent(me, "rentals", "open_menu");
-      return;
-    }
     if (isSettingsBtn) {
       await clearUserFlowOnly(ctx);
       await renderSettingsMenu(ctx, me);
@@ -3494,6 +4527,31 @@ bot.on("text", async (ctx) => {
       return;
     }
     await renderAdminUserCard(ctx, target, flow.payload.returnPage);
+    return;
+  }
+
+  if (flow?.mode === "admin_steam_proxy_input" && hasRole(me, ["ADMIN"])) {
+    try {
+      const lines = trimmed.split(/\r?\n+/).map((line) => line.trim()).filter(Boolean);
+      const normalized = lines.map((line) => normalizeSteamProxyUrl(line)).filter(Boolean);
+      if (normalized.length) {
+        for (const proxy of normalized) addSteamProxyUrl(proxy);
+      } else {
+        clearSteamProxies();
+      }
+      state.delete(ctx.from.id);
+      const resultText = normalized.length
+        ? `\u0434\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u044b: ${normalized.length}`
+        : "\u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u044b";
+      await ctx.reply(`<b>Steam \u043f\u0440\u043e\u043a\u0441\u0438 ${resultText}.</b>\n\u0420\u0435\u0436\u0438\u043c: <b>${escapeHtml(steamProxyStatusText())}</b>`, {
+        parse_mode: "HTML",
+      }).catch(() => null);
+      logEvent(me, "admin_steam_proxy", normalized.length ? `add:${normalized.length}` : "clear");
+    } catch {
+      await ctx.reply("<b>\u041f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u0442.</b>\n\u0424\u043e\u0440\u043c\u0430\u0442: <code>socks5://user:pass@host:port</code>\n\u0418\u043b\u0438: <code>off</code>", {
+        parse_mode: "HTML",
+      }).catch(() => null);
+    }
     return;
   }
 
@@ -3538,6 +4596,11 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (/^(Steam Proxy|Steam \u043f\u0440\u043e\u043a\u0441\u0438)$/i.test(trimmed) && hasRole(me, ["ADMIN"])) {
+    await renderAdminSteamProxy(ctx);
+    return;
+  }
+
   await showMainMenu(ctx, me);
 });
 
@@ -3560,6 +4623,49 @@ bot.on("callback_query", async (ctx, next) => {
 
   if (data === "admin:userlist:noop" || data === "logs:noop") {
     await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "admin:steam_proxy") {
+    await renderAdminSteamProxy(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "admin:steam_proxy:set") {
+    state.set(ctx.from.id, { mode: "admin_steam_proxy_input" });
+    await replaceOrReply(ctx, "<b>\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 Steam \u043f\u0440\u043e\u043a\u0441\u0438.</b>\n\u041c\u043e\u0436\u043d\u043e \u043f\u0430\u0447\u043a\u043e\u0439, \u043a\u0430\u0436\u0434\u044b\u0439 \u0441 \u043d\u043e\u0432\u043e\u0439 \u0441\u0442\u0440\u043e\u043a\u0438:\n<code>user:pass@host:port</code>\n<code>socks5://user:pass@host:port</code>\n\u041e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0432\u0441\u0435: <code>off</code>", {
+      parse_mode: "HTML",
+    });
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "admin:steam_proxy:clear") {
+    clearSteamProxies();
+    await renderAdminSteamProxy(ctx);
+    await ctx.answerCbQuery("Steam \u043f\u0440\u043e\u043a\u0441\u0438 \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u044b").catch(() => null);
+    return;
+  }
+
+  if (data === "admin:steam_proxy:delete_menu") {
+    await renderAdminSteamProxyDeleteMenu(ctx);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "admin:steam_proxy:delete_all") {
+    clearSteamProxies();
+    await renderAdminSteamProxy(ctx);
+    await ctx.answerCbQuery("\u0412\u0441\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0443\u0434\u0430\u043b\u0435\u043d\u044b").catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("admin:steam_proxy:delete:")) {
+    const proxyId = Number(data.split(":").pop() || 0);
+    const ok = deleteSteamProxy(proxyId);
+    await renderAdminSteamProxy(ctx);
+    await ctx.answerCbQuery(ok ? "\u041f\u0440\u043e\u043a\u0441\u0438 \u0443\u0434\u0430\u043b\u0435\u043d" : "\u041f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", { show_alert: !ok }).catch(() => null);
     return;
   }
 
@@ -3603,6 +4709,13 @@ bot.on("callback_query", async (ctx, next) => {
   if (data === "rent:list") {
     state.delete(ctx.from.id);
     await renderRentalsList(ctx, me);
+    await ctx.answerCbQuery().catch(() => null);
+    return;
+  }
+
+  if (data === "rent:rules") {
+    state.delete(ctx.from.id);
+    await renderRentalsRules(ctx, { instant: true });
     await ctx.answerCbQuery().catch(() => null);
     return;
   }
@@ -3696,6 +4809,7 @@ bot.on("callback_query", async (ctx, next) => {
 
     rental.is_busy = 1;
     rental.rented_by_user_id = requester.id;
+    rental.rented_at = nowIso();
     ensureGuardAttempt(Number(rental.id), Number(requester.id), 1);
     saveState();
     await clearRentalRequestMessages(ctx, rental, requester);
@@ -3806,18 +4920,12 @@ bot.on("callback_query", async (ctx, next) => {
     const shouldCancel = data.startsWith("rent:report:cancel_yes:");
     const report = getRentReportById(Number(data.split(":")[3] || 0));
     const rental = report ? getRentalById(Number(report.rental_id)) : null;
-    const renter = report ? getUserById(Number(report.user_id)) : null;
     if (!report || !rental) {
       await ctx.answerCbQuery("Отчет не найден", { show_alert: true }).catch(() => null);
       return;
     }
     if (shouldCancel) {
-      cancelRental(rental);
-      if (renter?.tg_id) {
-        await ctx.telegram.sendMessage(Number(renter.tg_id), `<b>Аренда аккаунта №${rental.number} отменена.</b>`, {
-          parse_mode: "HTML",
-        }).catch(() => null);
-      }
+      await cancelRentalWithSteamSessions(rental);
       logEvent(me, "rent_report", `cancel:${report.id}:rental:${rental.number}`);
       await replaceOrReply(ctx, "<b>Аренда отменена.</b>", { parse_mode: "HTML" });
     } else {
@@ -3870,19 +4978,14 @@ bot.on("callback_query", async (ctx, next) => {
       await ctx.answerCbQuery("Нет доступа", { show_alert: true }).catch(() => null);
       return;
     }
-    const rental = getRentalByNumber(Number(data.split(":")[2] || 0));
+    const rental = getRentalById(Number(data.split(":")[2] || 0));
     if (!rental || Number(rental.is_busy || 0) !== 1) {
       await ctx.answerCbQuery("Активная аренда не найдена", { show_alert: true }).catch(() => null);
       await renderRentalsCancelMenu(ctx);
       return;
     }
     const renter = getUserById(Number(rental.rented_by_user_id || 0));
-    cancelRental(rental);
-    if (renter?.tg_id) {
-      await ctx.telegram.sendMessage(Number(renter.tg_id), `<b>Аренда аккаунта №${rental.number} отменена.</b>`, {
-        parse_mode: "HTML",
-      }).catch(() => null);
-    }
+    await cancelRentalWithSteamSessions(rental);
     logEvent(me, "rentals", `cancel:${rental.number}:user:${renter?.id || 0}`);
     await ctx.answerCbQuery("Аренда отменена").catch(() => null);
     await renderRentalsCancelMenu(ctx);
