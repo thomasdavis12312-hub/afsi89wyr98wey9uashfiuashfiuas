@@ -89,12 +89,15 @@ const steamProxyFailureUntil = new Map<string, number>();
 const activeBroadcasts = new Set<string>();
 let onlineWatchLoopStarted = false;
 let rentReportLoopStarted = false;
+let rentReportTickInFlight = false;
 let rentDiscordBridgeLoopStarted = false;
 let steamProxyLastUrl = "";
 let steamProxyOverrideUrl: string | null = null;
 
 const steamIdResolveCache = new Map<string, { steamId: string; updatedAt: number }>();
 const invitePageCache = new Map<string, InvitePageData & { updatedAt: number }>();
+const rentReportReservationKeys = new Set<string>();
+let moscowTimeCache: { value: { dateKey: string; hour: number; minute: number }; updatedAt: number } | null = null;
 const STEAM_ABORT_RESOURCE_TYPES = new Set(["media", "font", "websocket"]);
 const STEAM_SCREENSHOT_CLIP_DEFAULT = { x: 0, y: 122, width: 1920, height: 810 };
 const STEAM_SCREENSHOT_CLIP_WITH_HEADER = { x: 0, y: 0, width: 1920, height: 932 };
@@ -102,6 +105,8 @@ const STEAM_FRIEND_TEMPLATE_VIEWPORT = { width: 1920, height: 1080 };
 const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
 const RENT_REPORT_HOUR_MSK = 21;
 const RENT_REPORT_MINUTE_MSK = 0;
+const RENT_REPORT_POLL_INTERVAL_MS = 30_000;
+const RENT_REPORT_TIME_SOURCE_URL = "https://worldtimeapi.org/api/timezone/Europe/Moscow";
 
 let steamBrowser: any = null;
 let steamPage: any = null;
@@ -1464,8 +1469,33 @@ function moscowNowParts(date = new Date()) {
   };
 }
 
-function isAtOrAfterRentReportTime(moscow: { hour: number; minute: number }) {
-  return moscow.hour > RENT_REPORT_HOUR_MSK || (moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute >= RENT_REPORT_MINUTE_MSK);
+async function moscowNowPartsFromTrustedSource() {
+  if (moscowTimeCache && Date.now() - moscowTimeCache.updatedAt < 15_000) {
+    return moscowTimeCache.value;
+  }
+  try {
+    const response = await fetch(RENT_REPORT_TIME_SOURCE_URL, {
+      headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (response.ok) {
+      const payload = (await response.json()) as any;
+      const datetime = String(payload?.datetime || "").trim();
+      const parsed = new Date(datetime);
+      if (!Number.isNaN(parsed.getTime())) {
+        const value = moscowNowParts(parsed);
+        moscowTimeCache = { value, updatedAt: Date.now() };
+        return value;
+      }
+    }
+  } catch (error) {
+    console.warn("[RENT REPORT TIME SOURCE FAILED]", error);
+  }
+  return null;
+}
+
+function isRentReportRequestMinute(moscow: { hour: number; minute: number }) {
+  return moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute === RENT_REPORT_MINUTE_MSK;
 }
 
 function isRentalStartedAfterTodayReportTime(rental: any, dateKey: string) {
@@ -1505,6 +1535,47 @@ function findDailyRentReport(rental: any, dateKey: string) {
       Number(report.user_id || 0) === Number(rental.rented_by_user_id || 0) &&
       reportRequestDateKey(report) === dateKey,
   ) || null;
+}
+
+function rentReportReservationKey(rental: any, userId: number, dateKey: string) {
+  return `${Number(rental.id || 0)}:${Number(userId || 0)}:${dateKey}`;
+}
+
+function reserveDailyRentReport(rental: any, renter: any, dateKey: string) {
+  const key = rentReportReservationKey(rental, Number(renter.id || 0), dateKey);
+  if (rentReportReservationKeys.has(key)) return null;
+  const existingReport = findDailyRentReport(rental, dateKey);
+  if (existingReport) {
+    rental.last_report_date = dateKey;
+    if (!rental.report_deadline_at && String(existingReport.deadline_at || "")) {
+      rental.report_deadline_at = existingReport.deadline_at;
+    }
+    saveState();
+    return null;
+  }
+  rentReportReservationKeys.add(key);
+  const reports = rentReports();
+  const report = {
+    id: nextRowId(reports),
+    rental_id: Number(rental.id),
+    rental_number: Number(rental.number),
+    user_id: Number(renter.id),
+    report_date: dateKey,
+    status: "REQUESTED",
+    requested_at: nowIso(),
+    deadline_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    submitted_at: null,
+    reviewed_at: null,
+    reviewed_by_user_id: null,
+    file_id: null,
+    file_unique_id: null,
+    admin_comment: null,
+  };
+  reports.push(report);
+  rental.report_deadline_at = report.deadline_at;
+  rental.last_report_date = dateKey;
+  saveState();
+  return report;
 }
 
 function rentDiscordPendingRows() {
@@ -1553,6 +1624,12 @@ function rentDiscordPendingFor(rentalNumber: number, userId: number) {
 
 function getRentReportById(reportId: number) {
   return rentReports().find((row) => Number(row.id) === Number(reportId)) || null;
+}
+
+function canSubmitRentReport(report: any) {
+  const status = String(report?.status || "");
+  const deadline = Date.parse(String(report?.deadline_at || ""));
+  return (status === "REQUESTED" || status === "RETRY_REQUESTED") && Number.isFinite(deadline) && deadline > Date.now();
 }
 
 function steamCookieHeaderFromRental(rental: any) {
@@ -2468,6 +2545,19 @@ function activeReportMissCount(rental: any) {
     .filter((value: number) => Number.isFinite(value) && value >= weekAgo).length;
 }
 
+function markExpiredRentReportAsMissed(rental: any, deadline: string) {
+  const report = rentReports().find(
+    (row) =>
+      Number(row.rental_id || 0) === Number(rental.id || 0) &&
+      String(row.deadline_at || "") === deadline &&
+      (String(row.status || "") === "REQUESTED" || String(row.status || "") === "RETRY_REQUESTED"),
+  );
+  if (!report) return null;
+  report.status = "MISSED";
+  report.missed_at = nowIso();
+  return report;
+}
+
 function rentalDiscordLabel(rental: any, renter: any) {
   const userDiscord = String(renter?.discord_tag || renter?.discord_id || "").trim();
   if (userDiscord) return userDiscord;
@@ -2728,40 +2818,12 @@ async function notifyRentalManagers(ctx: Ctx, rental: any, requester: any, disco
   return managers.length;
 }
 
-async function sendRentalReportReminder(rental: any) {
+async function sendRentalReportReminder(rental: any, reportDate: string) {
   const renter = getUserById(Number(rental.rented_by_user_id || 0));
   if (!renter?.tg_id) return false;
-  const reportDate = moscowNowParts().dateKey;
-  const existingReport = findDailyRentReport(rental, reportDate);
-  if (existingReport) {
-    rental.last_report_date = reportDate;
-    if (!rental.report_deadline_at && String(existingReport.deadline_at || "")) {
-      rental.report_deadline_at = existingReport.deadline_at;
-    }
-    saveState();
-    return false;
-  }
-  const reports = rentReports();
-  const report = {
-    id: nextRowId(reports),
-    rental_id: Number(rental.id),
-    rental_number: Number(rental.number),
-    user_id: Number(renter.id),
-    report_date: reportDate,
-    status: "REQUESTED",
-    requested_at: nowIso(),
-    deadline_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-    submitted_at: null,
-    reviewed_at: null,
-    reviewed_by_user_id: null,
-    file_id: null,
-    file_unique_id: null,
-    admin_comment: null,
-  };
-  reports.push(report);
-  rental.report_deadline_at = report.deadline_at;
-  rental.last_report_date = reportDate;
-  saveState();
+  if (Number(rental.rented_by_user_id || 0) !== Number(renter.id || 0)) return false;
+  const report = reserveDailyRentReport(rental, renter, reportDate);
+  if (!report) return false;
 
   const text =
     `<b>Пора предоставить отчет по аренде аккаунта №${rental.number}.</b>\n\n` +
@@ -2776,7 +2838,7 @@ async function sendRentalReportReminder(rental: any) {
     rental.last_report_message_id = sent.message_id;
     saveState();
   }
-  return true;
+  return Boolean(sent);
 }
 
 async function notifyRentalReportManagers(ctx: Ctx, report: any) {
@@ -2806,11 +2868,15 @@ async function notifyRentalReportManagers(ctx: Ctx, report: any) {
 }
 
 async function runRentReportTick() {
-  const moscow = moscowNowParts();
+  if (rentReportTickInFlight) return;
+  rentReportTickInFlight = true;
+  try {
+    const moscow = await moscowNowPartsFromTrustedSource();
   for (const rental of activeRentalRows()) {
     const deadline = String(rental.report_deadline_at || "");
     if (deadline && Date.parse(deadline) <= Date.now()) {
       const renter = getUserById(Number(rental.rented_by_user_id || 0));
+      markExpiredRentReportAsMissed(rental, deadline);
       const misses = markRentalReportMiss(rental);
       rental.report_deadline_at = null;
       saveState();
@@ -2833,13 +2899,17 @@ async function runRentReportTick() {
       continue;
     }
     if (
-      isAtOrAfterRentReportTime(moscow) &&
+      moscow &&
+      isRentReportRequestMinute(moscow) &&
       !isRentalStartedAfterTodayReportTime(rental, moscow.dateKey) &&
       String(rental.last_report_date || "") !== moscow.dateKey &&
       !findDailyRentReport(rental, moscow.dateKey)
     ) {
-      await sendRentalReportReminder(rental);
+      await sendRentalReportReminder(rental, moscow.dateKey);
     }
+  }
+  } finally {
+    rentReportTickInFlight = false;
   }
 }
 
@@ -2848,7 +2918,7 @@ function startRentReportLoop() {
   rentReportLoopStarted = true;
   setInterval(() => {
     runRentReportTick().catch((error) => console.error("[RENT REPORT LOOP ERROR]", error));
-  }, 60_000);
+  }, RENT_REPORT_POLL_INTERVAL_MS);
   runRentReportTick().catch(() => null);
 }
 
@@ -4177,7 +4247,7 @@ bot.on("photo", async (ctx) => {
 
   const report = getRentReportById(flow.payload.reportId);
   const rental = report ? getRentalById(Number(report.rental_id)) : null;
-  if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+  if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id) || !canSubmitRentReport(report)) {
     state.delete(ctx.from.id);
     await ctx.reply("<b>Активный запрос отчета не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
     return;
@@ -4830,7 +4900,7 @@ bot.on("callback_query", async (ctx, next) => {
   if (data.startsWith("rent:report:upload:")) {
     const report = getRentReportById(Number(data.split(":")[3] || 0));
     const rental = report ? getRentalById(Number(report.rental_id)) : null;
-    if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id)) {
+    if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id) || !canSubmitRentReport(report)) {
       await ctx.answerCbQuery("Запрос отчета не найден", { show_alert: true }).catch(() => null);
       return;
     }
