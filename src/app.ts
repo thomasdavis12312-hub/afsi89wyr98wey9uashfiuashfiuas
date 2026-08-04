@@ -1491,11 +1491,13 @@ async function moscowNowPartsFromTrustedSource() {
   } catch (error) {
     console.warn("[RENT REPORT TIME SOURCE FAILED]", error);
   }
-  return null;
+  const fallback = moscowNowParts();
+  moscowTimeCache = { value: fallback, updatedAt: Date.now() };
+  return fallback;
 }
 
-function isRentReportRequestMinute(moscow: { hour: number; minute: number }) {
-  return moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute === RENT_REPORT_MINUTE_MSK;
+function isRentReportRequestTimeReached(moscow: { hour: number; minute: number }) {
+  return moscow.hour > RENT_REPORT_HOUR_MSK || (moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute >= RENT_REPORT_MINUTE_MSK);
 }
 
 function isRentalStartedAfterTodayReportTime(rental: any, dateKey: string) {
@@ -2899,8 +2901,7 @@ async function runRentReportTick() {
       continue;
     }
     if (
-      moscow &&
-      isRentReportRequestMinute(moscow) &&
+      isRentReportRequestTimeReached(moscow) &&
       !isRentalStartedAfterTodayReportTime(rental, moscow.dateKey) &&
       String(rental.last_report_date || "") !== moscow.dateKey &&
       !findDailyRentReport(rental, moscow.dateKey)
