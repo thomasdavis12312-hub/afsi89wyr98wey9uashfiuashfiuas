@@ -1488,9 +1488,7 @@ async function moscowNowPartsFromTrustedSource() {
         return value;
       }
     }
-  } catch (error) {
-    console.warn("[RENT REPORT TIME SOURCE FAILED]", error);
-  }
+  } catch {}
   const fallback = moscowNowParts();
   moscowTimeCache = { value: fallback, updatedAt: Date.now() };
   return fallback;
@@ -1645,6 +1643,12 @@ function canSubmitRentReport(report: any) {
   const status = String(report?.status || "");
   const deadline = Date.parse(String(report?.deadline_at || ""));
   return (status === "REQUESTED" || status === "RETRY_REQUESTED") && Number.isFinite(deadline) && deadline > Date.now();
+}
+
+function findActiveRentReportForUser(userId: number) {
+  return rentReports()
+    .filter((report) => Number(report.user_id || 0) === Number(userId) && canSubmitRentReport(report))
+    .sort((a, b) => String(b.requested_at || "").localeCompare(String(a.requested_at || "")))[0] || null;
 }
 
 function steamCookieHeaderFromRental(rental: any) {
@@ -4261,9 +4265,10 @@ bot.on("photo", async (ctx) => {
   if (!me || Number(me.is_banned || 0) === 1) return;
 
   const flow = state.get(ctx.from.id);
-  if (flow?.mode !== "rent_report_upload") return;
+  const reportId = flow?.mode === "rent_report_upload" ? Number(flow.payload.reportId) : Number(findActiveRentReportForUser(me.id)?.id || 0);
+  if (!reportId) return;
 
-  const report = getRentReportById(flow.payload.reportId);
+  const report = getRentReportById(reportId);
   const rental = report ? getRentalById(Number(report.rental_id)) : null;
   if (!report || !rental || Number(rental.rented_by_user_id || 0) !== Number(me.id) || !canSubmitRentReport(report)) {
     state.delete(ctx.from.id);
