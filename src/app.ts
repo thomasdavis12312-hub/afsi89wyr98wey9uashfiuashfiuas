@@ -1580,6 +1580,19 @@ function reserveDailyRentReport(rental: any, renter: any, dateKey: string) {
   return report;
 }
 
+function releaseDailyRentReportReservation(rental: any, renter: any, report: any, dateKey: string) {
+  const key = rentReportReservationKey(rental, Number(renter.id || 0), dateKey);
+  rentReportReservationKeys.delete(key);
+  const reports = rentReports();
+  const reportIndex = reports.findIndex((row) => Number(row.id || 0) === Number(report?.id || 0));
+  if (reportIndex >= 0 && String(reports[reportIndex]?.status || "") === "REQUESTED" && !String(reports[reportIndex]?.file_id || "")) {
+    reports.splice(reportIndex, 1);
+  }
+  if (String(rental.last_report_date || "") === dateKey) rental.last_report_date = null;
+  if (String(rental.report_deadline_at || "") === String(report?.deadline_at || "")) rental.report_deadline_at = null;
+  saveState();
+}
+
 function rentDiscordPendingRows() {
   const stateData = appState();
   if (!Array.isArray(stateData.rent_discord_pending)) stateData.rent_discord_pending = [];
@@ -2836,11 +2849,15 @@ async function sendRentalReportReminder(rental: any, reportDate: string) {
     parse_mode: "HTML",
     reply_markup: Markup.inlineKeyboard([[Markup.button.callback("📸 Отправить отчет", `rent:report:upload:${report.id}`)]]).reply_markup,
   }).catch(() => null);
+  if (!sent?.message_id) {
+    releaseDailyRentReportReservation(rental, renter, report, reportDate);
+    return false;
+  }
   if (sent?.message_id) {
     rental.last_report_message_id = sent.message_id;
     saveState();
   }
-  return Boolean(sent);
+  return true;
 }
 
 async function notifyRentalReportManagers(ctx: Ctx, report: any) {
