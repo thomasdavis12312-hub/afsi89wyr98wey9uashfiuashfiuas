@@ -1451,25 +1451,6 @@ function nextRowId(rows: any[]) {
   return rows.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
 }
 
-function moscowNowParts(date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Moscow",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(date);
-  const value = (type: string) => parts.find((part) => part.type === type)?.value || "00";
-  const hour = Number(value("hour"));
-  return {
-    dateKey: `${value("year")}-${value("month")}-${value("day")}`,
-    hour: hour === 24 ? 0 : hour,
-    minute: Number(value("minute")),
-  };
-}
-
 function moscowNowPartsFromTimeApiPayload(payload: any) {
   const directYear = Number(payload?.year);
   const directMonth = Number(payload?.month);
@@ -1536,9 +1517,7 @@ async function moscowNowPartsFromTrustedSource() {
       }
     }
   } catch {}
-  const fallback = moscowNowParts();
-  moscowTimeCache = { value: fallback, updatedAt: Date.now() };
-  return fallback;
+  return null;
 }
 
 function isRentReportRequestMinute(moscow: { hour: number; minute: number }) {
@@ -1550,9 +1529,11 @@ function isRentalStartedAfterTodayReportTime(rental: any, dateKey: string) {
   if (!rentedAt) return false;
   const parsed = new Date(rentedAt);
   if (Number.isNaN(parsed.getTime())) return false;
-  const rentedMoscow = moscowNowParts(parsed);
-  if (rentedMoscow.dateKey !== dateKey) return false;
-  return rentedMoscow.hour > RENT_REPORT_HOUR_MSK || (rentedMoscow.hour === RENT_REPORT_HOUR_MSK && rentedMoscow.minute > RENT_REPORT_MINUTE_MSK);
+  const [year, month, day] = dateKey.split("-").map(Number);
+  if (![year, month, day].every(Number.isFinite)) return false;
+  const reportTimeUtc = Date.UTC(year, month - 1, day, RENT_REPORT_HOUR_MSK - 3, RENT_REPORT_MINUTE_MSK, 0, 0);
+  const nextReportDateUtc = Date.UTC(year, month - 1, day + 1, 0, 0, 0, 0);
+  return parsed.getTime() > reportTimeUtc && parsed.getTime() < nextReportDateUtc;
 }
 
 function activeRentalRows() {
@@ -1572,7 +1553,8 @@ function reportRequestDateKey(report: any) {
   if (!requestedAt) return "";
   const parsed = new Date(requestedAt);
   if (Number.isNaN(parsed.getTime())) return "";
-  return moscowNowParts(parsed).dateKey;
+  const moscowTimestamp = parsed.getTime() + 3 * 60 * 60 * 1000;
+  return new Date(moscowTimestamp).toISOString().slice(0, 10);
 }
 
 function findDailyRentReport(rental: any, dateKey: string) {
@@ -2990,6 +2972,7 @@ async function runRentReportTick() {
       continue;
     }
     if (
+      moscow &&
       isRentReportRequestMinute(moscow) &&
       !isRentalStartedAfterTodayReportTime(rental, moscow.dateKey) &&
       String(rental.last_report_date || "") !== moscow.dateKey &&
