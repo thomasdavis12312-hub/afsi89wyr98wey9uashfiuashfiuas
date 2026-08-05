@@ -106,7 +106,6 @@ const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com
 const RENT_REPORT_HOUR_MSK = 19;
 const RENT_REPORT_MINUTE_MSK = 15;
 const RENT_REPORT_POLL_INTERVAL_MS = 30_000;
-const RENT_REPORT_TIME_SOURCE_URL = "https://timeapi.io/api/v1/time/current/zone?timeZone=Europe/Moscow";
 
 let steamBrowser: any = null;
 let steamPage: any = null;
@@ -1451,73 +1450,29 @@ function nextRowId(rows: any[]) {
   return rows.reduce((max, row) => Math.max(max, Number(row.id || 0)), 0) + 1;
 }
 
-function moscowNowPartsFromTimeApiPayload(payload: any) {
-  const directYear = Number(payload?.year);
-  const directMonth = Number(payload?.month);
-  const directDay = Number(payload?.day);
-  const directHour = Number(payload?.hour);
-  const directMinute = Number(payload?.minute);
-  if ([directYear, directMonth, directDay, directHour, directMinute].every(Number.isFinite)) {
-    return {
-      dateKey: `${String(directYear).padStart(4, "0")}-${String(directMonth).padStart(2, "0")}-${String(directDay).padStart(2, "0")}`,
-      hour: directHour === 24 ? 0 : directHour,
-      minute: directMinute,
-    };
-  }
-
-  const dateTime = String(payload?.dateTime || payload?.local_time || "").trim();
-  const dateTimeMatch = dateTime.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/);
-  if (dateTimeMatch) {
-    const [, year, month, day, hourRaw, minuteRaw] = dateTimeMatch;
-    const hour = Number(hourRaw);
-    return {
-      dateKey: `${year}-${month}-${day}`,
-      hour: hour === 24 ? 0 : hour,
-      minute: Number(minuteRaw),
-    };
-  }
-
-  const date = String(payload?.date || "").trim();
-  const time = String(payload?.time || "").trim();
-  const [hourRaw, minuteRaw] = time.split(":").map(Number);
-  const isoDateMatch = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  const slashDateMatch = date.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  const matchedDate = isoDateMatch
-    ? { year: isoDateMatch[1], month: isoDateMatch[2], day: isoDateMatch[3] }
-    : slashDateMatch
-      ? { year: slashDateMatch[3], month: slashDateMatch[1].padStart(2, "0"), day: slashDateMatch[2].padStart(2, "0") }
-      : null;
-  if (matchedDate && Number.isFinite(hourRaw) && Number.isFinite(minuteRaw)) {
-    const hour = Number(hourRaw);
-    return {
-      dateKey: `${matchedDate.year}-${matchedDate.month}-${matchedDate.day}`,
-      hour: hour === 24 ? 0 : hour,
-      minute: Number(minuteRaw),
-    };
-  }
-
-  return null;
-}
-
 async function moscowNowPartsFromTrustedSource() {
   if (moscowTimeCache && Date.now() - moscowTimeCache.updatedAt < 15_000) {
     return moscowTimeCache.value;
   }
-  try {
-    const response = await fetch(RENT_REPORT_TIME_SOURCE_URL, {
-      headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (response.ok) {
-      const payload = (await response.json()) as any;
-      const value = moscowNowPartsFromTimeApiPayload(payload);
-      if (value) {
-        moscowTimeCache = { value, updatedAt: Date.now() };
-        return value;
-      }
-    }
-  } catch {}
-  return null;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const partValue = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || "";
+  const year = partValue("year");
+  const month = partValue("month");
+  const day = partValue("day");
+  const hour = Number(partValue("hour"));
+  const minute = Number(partValue("minute"));
+  if (!year || !month || !day || !Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  const value = { dateKey: `${year}-${month}-${day}`, hour: hour === 24 ? 0 : hour, minute };
+  moscowTimeCache = { value, updatedAt: Date.now() };
+  return value;
 }
 
 function isRentReportRequestMinute(moscow: { hour: number; minute: number }) {
