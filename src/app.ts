@@ -104,9 +104,9 @@ const STEAM_SCREENSHOT_CLIP_WITH_HEADER = { x: 0, y: 0, width: 1920, height: 932
 const STEAM_FRIEND_TEMPLATE_VIEWPORT = { width: 1920, height: 1080 };
 const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
 const RENT_REPORT_HOUR_MSK = 19;
-const RENT_REPORT_MINUTE_MSK = 4;
+const RENT_REPORT_MINUTE_MSK = 15;
 const RENT_REPORT_POLL_INTERVAL_MS = 30_000;
-const RENT_REPORT_TIME_SOURCE_URL = "https://timeapi.io/api/Time/current/zone?timeZone=Europe/Moscow";
+const RENT_REPORT_TIME_SOURCE_URL = "https://timeapi.io/api/v1/time/current/zone?timeZone=Europe/Moscow";
 
 let steamBrowser: any = null;
 let steamPage: any = null;
@@ -1389,7 +1389,7 @@ async function renderRentalsRules(ctx: Ctx, options?: { instant?: boolean }) {
     `<b>🧾 Условия аренды аккаунта</b>\n\n` +
     `Перед входом в раздел подтвердите правила:\n\n` +
     `1. <b>Ежедневная активность:</b> минимум <b>10 игр Turbo</b> или <b>5 игр Rating</b> в день.\n` +
-    `2. <b>Ежедневный отчет:</b> каждый день в <b>19:04 МСК</b> нужно отправлять скрин списка игр.\n` +
+    `2. <b>Ежедневный отчет:</b> каждый день в <b>19:15 МСК</b> нужно отправлять скрин списка игр.\n` +
     `3. <b>Отчеты обязательны:</b> если отчет не будет отправлен <b>2 раза за 7 дней</b>, аренда аккаунта будет отменена.\n` +
     `4. <b>Игры нельзя портить:</b> запрещены ливы, руин и любые действия, которые снижают порядочность аккаунта. За серьезный вред аккаунту доступ к аренде блокируется навсегда.\n` +
     `5. <b>Steam-ссылки запрещены:</b> нельзя отправлять ссылки в Steam Chat. Общение и переходы в Steam Chat выполняются самостоятельно, без рассылки ссылок.`;
@@ -5556,12 +5556,17 @@ async function startBot() {
 
 void startBot();
 
-process.once("SIGINT", async () => {
-  bot.stop("SIGINT");
+async function stopBot(signal: "SIGINT" | "SIGTERM") {
+  try {
+    bot.stop(signal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/Bot is not running/i.test(message)) {
+      console.error("[BOT STOP ERROR]", error);
+    }
+  }
   await closeSteamRenderer();
-});
+}
 
-process.once("SIGTERM", async () => {
-  bot.stop("SIGTERM");
-  await closeSteamRenderer();
-});
+process.once("SIGINT", () => void stopBot("SIGINT"));
+process.once("SIGTERM", () => void stopBot("SIGTERM"));
