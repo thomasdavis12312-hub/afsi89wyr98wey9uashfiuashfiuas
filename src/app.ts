@@ -103,8 +103,8 @@ const STEAM_SCREENSHOT_CLIP_DEFAULT = { x: 0, y: 122, width: 1920, height: 810 }
 const STEAM_SCREENSHOT_CLIP_WITH_HEADER = { x: 0, y: 0, width: 1920, height: 932 };
 const STEAM_FRIEND_TEMPLATE_VIEWPORT = { width: 1920, height: 1080 };
 const STEAM_FRIEND_FALLBACK_AVATAR_URL = "https://avatars.akamai.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
-const RENT_REPORT_HOUR_MSK = 21;
-const RENT_REPORT_MINUTE_MSK = 0;
+const RENT_REPORT_HOUR_MSK = 13;
+const RENT_REPORT_MINUTE_MSK = 20;
 const RENT_REPORT_POLL_INTERVAL_MS = 30_000;
 const RENT_REPORT_TIME_SOURCE_URL = "https://worldtimeapi.org/api/timezone/Europe/Moscow";
 
@@ -1389,7 +1389,7 @@ async function renderRentalsRules(ctx: Ctx, options?: { instant?: boolean }) {
     `<b>🧾 Условия аренды аккаунта</b>\n\n` +
     `Перед входом в раздел подтвердите правила:\n\n` +
     `1. <b>Ежедневная активность:</b> минимум <b>10 игр Turbo</b> или <b>5 игр Rating</b> в день.\n` +
-    `2. <b>Ежедневный отчет:</b> каждый день в <b>21:00 МСК</b> нужно отправлять скрин списка игр.\n` +
+    `2. <b>Ежедневный отчет:</b> каждый день в <b>13:20 МСК</b> нужно отправлять скрин списка игр.\n` +
     `3. <b>Отчеты обязательны:</b> если отчет не будет отправлен <b>2 раза за 7 дней</b>, аренда аккаунта будет отменена.\n` +
     `4. <b>Игры нельзя портить:</b> запрещены ливы, руин и любые действия, которые снижают порядочность аккаунта. За серьезный вред аккаунту доступ к аренде блокируется навсегда.\n` +
     `5. <b>Steam-ссылки запрещены:</b> нельзя отправлять ссылки в Steam Chat. Общение и переходы в Steam Chat выполняются самостоятельно, без рассылки ссылок.`;
