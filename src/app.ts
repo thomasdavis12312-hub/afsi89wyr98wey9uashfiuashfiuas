@@ -2840,7 +2840,10 @@ async function notifyRentalManagers(ctx: Ctx, rental: any, requester: any, disco
           Markup.button.callback("❌ Отклонить", `rent:req:decline:${rental.number}:${requester.id}`),
         ],
       ]).reply_markup,
-    }).catch(() => null);
+    }).catch((error: unknown) => {
+      console.error(`[RENT REQUEST MANAGER SEND FAILED] rental=${rental.number} manager_tg=${manager.tg_id}`, error);
+      return null;
+    });
     if (sent?.message_id) {
       db.prepare("INSERT INTO RENT_REQUEST_MESSAGES (RENTAL_ID, USER_ID, ADMIN_TG_ID, MESSAGE_ID) VALUES (?, ?, ?, ?)").run(
         rental.id,
@@ -2900,7 +2903,10 @@ async function notifyRentalReportManagers(ctx: Ctx, report: any) {
           Markup.button.callback("❌ Отклонить", `rent:report:reject:${report.id}`),
         ],
       ]).reply_markup,
-    }).catch(() => null);
+    }).catch((error: unknown) => {
+      console.error(`[RENT REPORT MANAGER SEND FAILED] report=${report.id} rental=${rental.number} manager_tg=${manager.tg_id}`, error);
+      return null;
+    });
     if (sent) sentCount += 1;
   }
   return sentCount;
@@ -4299,15 +4305,24 @@ bot.on("photo", async (ctx) => {
     return;
   }
 
-  report.status = "SUBMITTED";
-  report.submitted_at = nowIso();
   report.file_id = photo.file_id;
   report.file_unique_id = photo.file_unique_id || null;
+
+  const sent = await notifyRentalReportManagers(ctx, report);
+  if (sent <= 0) {
+    report.file_id = null;
+    report.file_unique_id = null;
+    saveState();
+    await ctx.reply("<b>Не удалось отправить отчет проверяющим. Попробуйте отправить фото еще раз чуть позже.</b>", { parse_mode: "HTML" }).catch(() => null);
+    logEvent(me, "rent_report", `submit_failed:${report.id}:rental:${rental.number}:managers:0`);
+    return;
+  }
+
+  report.status = "SUBMITTED";
+  report.submitted_at = nowIso();
   rental.report_deadline_at = null;
   saveState();
   state.delete(ctx.from.id);
-
-  const sent = await notifyRentalReportManagers(ctx, report);
   await ctx.reply(`<b>Отчет отправлен на проверку.</b>\nПроверяющих уведомлено: <b>${sent}</b>`, { parse_mode: "HTML" }).catch(() => null);
   logEvent(me, "rent_report", `submit:${report.id}:rental:${rental.number}:managers:${sent}`);
 });
