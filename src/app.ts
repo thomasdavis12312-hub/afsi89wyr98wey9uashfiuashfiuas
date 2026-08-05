@@ -1459,12 +1459,13 @@ function moscowNowParts(date = new Date()) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
+    hourCycle: "h23",
   }).formatToParts(date);
   const value = (type: string) => parts.find((part) => part.type === type)?.value || "00";
+  const hour = Number(value("hour"));
   return {
     dateKey: `${value("year")}-${value("month")}-${value("day")}`,
-    hour: Number(value("hour")),
+    hour: hour === 24 ? 0 : hour,
     minute: Number(value("minute")),
   };
 }
@@ -1494,8 +1495,8 @@ async function moscowNowPartsFromTrustedSource() {
   return fallback;
 }
 
-function isRentReportRequestTimeReached(moscow: { hour: number; minute: number }) {
-  return moscow.hour > RENT_REPORT_HOUR_MSK || (moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute >= RENT_REPORT_MINUTE_MSK);
+function isRentReportRequestMinute(moscow: { hour: number; minute: number }) {
+  return moscow.hour === RENT_REPORT_HOUR_MSK && moscow.minute >= RENT_REPORT_MINUTE_MSK && moscow.minute <= RENT_REPORT_MINUTE_MSK + 1;
 }
 
 function isRentalStartedAfterTodayReportTime(rental: any, dateKey: string) {
@@ -2553,6 +2554,21 @@ function markRentalReportMiss(rental: any) {
   return rental.report_misses.length;
 }
 
+function removeRentalReportMisses(rental: any, count: number) {
+  const removeCount = Math.max(0, Math.floor(Number(count || 0)));
+  if (!rental || removeCount <= 0) return 0;
+  const misses = (Array.isArray(rental.report_misses) ? rental.report_misses : [])
+    .map((value: any) => Date.parse(String(value)))
+    .filter((value: number) => Number.isFinite(value))
+    .sort((a: number, b: number) => a - b);
+  const before = misses.length;
+  rental.report_misses = misses
+    .slice(0, Math.max(0, misses.length - removeCount))
+    .map((value: number) => new Date(value).toISOString());
+  saveState();
+  return before - rental.report_misses.length;
+}
+
 function rentalBackButton() {
   return Markup.button.callback("⬅️ Назад", "rent:list");
 }
@@ -2922,7 +2938,7 @@ async function runRentReportTick() {
       continue;
     }
     if (
-      isRentReportRequestTimeReached(moscow) &&
+      isRentReportRequestMinute(moscow) &&
       !isRentalStartedAfterTodayReportTime(rental, moscow.dateKey) &&
       String(rental.last_report_date || "") !== moscow.dateKey &&
       !findDailyRentReport(rental, moscow.dateKey)
@@ -4388,6 +4404,34 @@ bot.on("text", async (ctx) => {
       ).catch(() => null);
     }
     logEvent(me, "rentals", `guardset:${rental.number}`);
+    return;
+  }
+
+  const deleteMissesMatch = trimmed.match(/^\/del(?:@[\w_]+)?\s+(\d+)\s+(\d+)$/i);
+  if (deleteMissesMatch) {
+    if (!canManageRentals(me)) {
+      await ctx.reply("<b>Нет доступа.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const rentalNumber = Number(deleteMissesMatch[1] || 0);
+    const count = Number(deleteMissesMatch[2] || 0);
+    const rental = getRentalByNumber(rentalNumber);
+    if (!rental) {
+      await ctx.reply("<b>Аккаунт не найден.</b>", { parse_mode: "HTML" }).catch(() => null);
+      return;
+    }
+    const before = activeReportMissCount(rental);
+    const removed = removeRentalReportMisses(rental, count);
+    const after = activeReportMissCount(rental);
+    await ctx.reply(
+      `<b>Пропущенные отчеты списаны.</b>\n` +
+        `Аккаунт: <b>№${rental.number}</b>\n` +
+        `Было: <b>${before}</b>\n` +
+        `Убрано: <b>${removed}</b>\n` +
+        `Осталось: <b>${after}</b>`,
+      { parse_mode: "HTML" },
+    ).catch(() => null);
+    logEvent(me, "rent_report", `delete_misses:rental:${rental.number}:count:${removed}`);
     return;
   }
 
